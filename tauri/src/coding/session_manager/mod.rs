@@ -2,6 +2,7 @@ mod claude_code;
 mod claude_desktop;
 mod codex;
 mod codex_rollout;
+mod codex_scratch;
 mod dsh;
 mod gemini_cli;
 mod grok;
@@ -37,6 +38,12 @@ use crate::coding::runtime_location::{
 use crate::db::helpers::db_get;
 use crate::db::schema::DbTable;
 use crate::db::SqliteDbState;
+
+pub use codex_scratch::{
+    CodexCleanupFailure, CodexCleanupOptions, CodexCleanupPreview, CodexCleanupPreviewItem,
+    CodexCleanupSkip, CodexCleanupSummary, CodexScratchResidue, CodexScratchResidueTrustEntry,
+    CodexScratchResidueWorkspace,
+};
 
 const SESSION_CACHE_TTL: Duration = Duration::from_secs(15);
 const MAX_SESSION_CACHE_ENTRIES: usize = 16;
@@ -242,6 +249,19 @@ pub struct DeleteSessionFailure {
 pub struct DeleteToolSessionsResult {
     pub deleted_count: usize,
     pub failed_items: Vec<DeleteSessionFailure>,
+    /// Auxiliary Codex scratch cleanup, reported separately from the deletion:
+    /// a cleanup failure is never a deletion failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<CodexCleanupSummary>,
+}
+
+/// The result of deleting one session, including any auxiliary cleanup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteToolSessionResult {
+    pub source_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<CodexCleanupSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,6 +398,14 @@ impl SessionSourceMode {
         matches!(self, Self::All)
             || matches!((self, source), (Self::Local, SessionRuntimeSource::Local))
             || matches!((self, source), (Self::Wsl, SessionRuntimeSource::Wsl))
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Local => "local",
+            Self::Wsl => "wsl",
+        }
     }
 }
 
@@ -563,6 +591,10 @@ impl SessionTool {
     }
 }
 
+fn opencode_reads_v2(config_path: &Path) -> bool {
+    crate::coding::open_code::v2_migration::is_active(config_path)
+}
+
 impl ToolSessionContext {
     fn cache_key(&self) -> String {
         match self {
@@ -593,12 +625,17 @@ impl ToolSessionContext {
                 state_root,
                 sqlite_db_path,
             } => format!(
-                "opencode:{}:{}:{}:{}:{}",
+                "opencode:{}:{}:{}:{}:{}:{}",
                 runtime_location.host_path.display(),
                 config_path.display(),
                 data_root.display(),
                 state_root.display(),
-                sqlite_db_path.display()
+                sqlite_db_path.display(),
+                if opencode_reads_v2(config_path) {
+                    "v2"
+                } else {
+                    "v1"
+                }
             ),
             Self::Pi { sessions_root } => format!("pi:{}", sessions_root.display()),
             Self::OhMyPi { sessions_root } => format!("oh_my_pi:{}", sessions_root.display()),
@@ -730,13 +767,16 @@ pub async fn delete_tool_session(
     state: tauri::State<'_, SqliteDbState>,
     tool: String,
     source_path: String,
-) -> Result<(), String> {
+    cleanup: Option<CodexCleanupOptions>,
+) -> Result<DeleteToolSessionResult, String> {
     let session_tool = SessionTool::parse(tool.trim())?;
     let contexts = resolve_session_contexts(&state.db(), session_tool).await?;
 
-    tauri::async_runtime::spawn_blocking(move || delete_session_blocking(contexts, source_path))
-        .await
-        .map_err(|error| format!("Failed to delete session: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        delete_session_blocking(contexts, source_path, cleanup.unwrap_or_default())
+    })
+    .await
+    .map_err(|error| format!("Failed to delete session: {error}"))?
 }
 
 #[tauri::command]
@@ -744,13 +784,108 @@ pub async fn delete_tool_sessions(
     state: tauri::State<'_, SqliteDbState>,
     tool: String,
     source_paths: Vec<String>,
+    cleanup: Option<CodexCleanupOptions>,
 ) -> Result<DeleteToolSessionsResult, String> {
     let session_tool = SessionTool::parse(tool.trim())?;
     let contexts = resolve_session_contexts(&state.db(), session_tool).await?;
 
-    tauri::async_runtime::spawn_blocking(move || delete_sessions_blocking(contexts, source_paths))
-        .await
-        .map_err(|error| format!("Failed to delete sessions: {error}"))
+    tauri::async_runtime::spawn_blocking(move || {
+        delete_sessions_blocking(contexts, source_paths, cleanup.unwrap_or_default())
+    })
+    .await
+    .map_err(|error| format!("Failed to delete sessions: {error}"))
+}
+
+/// Bound on a Codex residue scan or cleanup.
+///
+/// Both walk every rollout head of a Codex home, so they are allowed more time
+/// than a single config read while still failing on a dead WSL root.
+const CODEX_RESIDUE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Bound on the cleanup preview a delete confirmation waits for.
+///
+/// It sits on the critical path of *every* Codex delete — the dialog cannot open
+/// before it answers — so it is capped shorter than the scan it resembles. A
+/// preview that runs out of time costs the dialog its optional checkboxes, which
+/// the user can retry; a dialog that never opens blocks the delete itself.
+const CODEX_CLEANUP_PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The Codex scratch cleanup a delete could offer for the given sessions.
+///
+/// Read-only: nothing is removed here, and a failure to inspect only means the
+/// confirmation dialog shows no cleanup options.
+#[tauri::command]
+pub async fn preview_codex_session_cleanup(
+    state: tauri::State<'_, SqliteDbState>,
+    tool: String,
+    source_paths: Vec<String>,
+) -> Result<CodexCleanupPreview, String> {
+    let session_tool = SessionTool::parse(tool.trim())?;
+    if !matches!(session_tool, SessionTool::Codex) {
+        return Ok(CodexCleanupPreview { items: Vec::new() });
+    }
+
+    let contexts = resolve_session_contexts(&state.db(), session_tool).await?;
+
+    crate::coding::file_io::run_blocking_fs_operation(
+        CODEX_CLEANUP_PREVIEW_TIMEOUT,
+        "inspect the Codex cleanup candidates",
+        "the sessions being deleted",
+        move || Ok(codex_scratch::preview(&contexts, &source_paths)),
+    )
+    .await
+}
+
+/// List the Codex project-less chat residue that no session references any more.
+#[tauri::command]
+pub async fn scan_codex_scratch_residue(
+    state: tauri::State<'_, SqliteDbState>,
+    source_mode: Option<String>,
+) -> Result<CodexScratchResidue, String> {
+    let parsed_mode = SessionSourceMode::parse(source_mode)?;
+    let contexts = resolve_session_contexts(&state.db(), SessionTool::Codex).await?;
+
+    crate::coding::file_io::run_blocking_fs_operation(
+        CODEX_RESIDUE_IO_TIMEOUT,
+        "scan Codex scratch residue",
+        "the selected Codex source",
+        move || Ok(codex_scratch::scan_residue(&contexts, parsed_mode)),
+    )
+    .await
+}
+
+/// Remove the selected Codex scratch residue.
+///
+/// Eligibility is re-checked here: the scan result the dialog showed may be old.
+/// The cleanup re-walks the rollout tree to do that, so it gets the same budget
+/// as the scan — reporting a timeout while the deletions carry on in the
+/// background would leave the user with neither a result nor an error.
+#[tauri::command]
+pub async fn clean_codex_scratch_residue(
+    state: tauri::State<'_, SqliteDbState>,
+    source_mode: Option<String>,
+    workspace_paths: Vec<String>,
+    trust_keys: Vec<String>,
+    date_dirs: Vec<String>,
+) -> Result<CodexCleanupSummary, String> {
+    let parsed_mode = SessionSourceMode::parse(source_mode)?;
+    let contexts = resolve_session_contexts(&state.db(), SessionTool::Codex).await?;
+
+    crate::coding::file_io::run_blocking_fs_operation(
+        CODEX_RESIDUE_IO_TIMEOUT,
+        "clean Codex scratch residue",
+        "the selected Codex source",
+        move || {
+            Ok(codex_scratch::clean_residue(
+                &contexts,
+                parsed_mode,
+                &workspace_paths,
+                &trust_keys,
+                &date_dirs,
+            ))
+        },
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1355,7 +1490,8 @@ fn list_sessions_blocking(
         .filter(|session| session_activity_in_range(&session.meta, time_bounds.as_ref()))
         .collect();
 
-    let available_paths = build_session_paths_from_contexts(&time_filtered_sessions, DEFAULT_SESSION_PATH_LIMIT);
+    let available_paths =
+        build_session_paths_from_contexts(&time_filtered_sessions, DEFAULT_SESSION_PATH_LIMIT);
     let path_filtered_sessions = if let Some(path_filter_text) = path_filter.as_deref() {
         filter_sessions_by_path_with_context(time_filtered_sessions, path_filter_text)
     } else {
@@ -1451,30 +1587,61 @@ fn list_session_paths_blocking(
     Ok(build_session_paths(&sessions, limit))
 }
 
-fn delete_session_blocking(contexts: SessionContextSet, source_path: String) -> Result<(), String> {
+fn delete_session_blocking(
+    contexts: SessionContextSet,
+    source_path: String,
+    cleanup: CodexCleanupOptions,
+) -> Result<DeleteToolSessionResult, String> {
     match find_session_with_context(&contexts, &source_path, true) {
         Ok((entry, session)) => {
+            let cleanup_requests = if cleanup.is_empty() {
+                Vec::new()
+            } else {
+                codex_scratch::delete_requests(&contexts, std::slice::from_ref(&source_path))
+            };
+
             delete_session_from_meta(&entry.context, &session)?;
             invalidate_cache(&entry.context);
-            Ok(())
+
+            Ok(DeleteToolSessionResult {
+                source_path: session.source_path,
+                cleanup: run_codex_cleanup(cleanup_requests, cleanup),
+            })
         }
         Err(error) => {
             let mut handled_by_opencode = false;
             for entry in &contexts.entries {
-                if matches!(entry.context, ToolSessionContext::OpenCode { .. }) {
-                    open_code::delete_session(&source_path)?;
+                if let ToolSessionContext::OpenCode { config_path, .. } = &entry.context {
+                    open_code::delete_session(&source_path, opencode_reads_v2(config_path))?;
                     invalidate_cache(&entry.context);
                     handled_by_opencode = true;
                 }
             }
 
             if handled_by_opencode {
-                Ok(())
+                Ok(DeleteToolSessionResult {
+                    source_path,
+                    cleanup: None,
+                })
             } else {
                 Err(error)
             }
         }
     }
+}
+
+/// Run an auxiliary cleanup, reporting it only when it has something to say.
+fn run_codex_cleanup(
+    requests: Vec<codex_scratch::CodexCleanupRequest>,
+    options: CodexCleanupOptions,
+) -> Option<CodexCleanupSummary> {
+    if options.is_empty() {
+        return None;
+    }
+
+    let mut summary = CodexCleanupSummary::default();
+    codex_scratch::run_cleanup(&requests, options, &mut summary);
+    (!summary.is_empty()).then_some(summary)
 }
 
 fn matches_session_source(
@@ -1517,8 +1684,8 @@ fn delete_session_from_meta(
         ToolSessionContext::OpenClaw { .. } => {
             open_claw::delete_session(Path::new(&session.source_path))?;
         }
-        ToolSessionContext::OpenCode { .. } => {
-            open_code::delete_session(&session.source_path)?;
+        ToolSessionContext::OpenCode { config_path, .. } => {
+            open_code::delete_session(&session.source_path, opencode_reads_v2(config_path))?;
         }
         ToolSessionContext::Pi { .. } => {
             pi::delete_session(Path::new(&session.source_path))?;
@@ -1549,10 +1716,12 @@ fn delete_session_from_meta(
 fn delete_sessions_blocking(
     contexts: SessionContextSet,
     source_paths: Vec<String>,
+    cleanup: CodexCleanupOptions,
 ) -> DeleteToolSessionsResult {
     let mut deleted_count = 0usize;
     let mut failed_items = Vec::new();
     let mut seen_paths = HashSet::new();
+    let mut resolved = Vec::new();
 
     for source_path in source_paths {
         let trimmed_source_path = source_path.trim();
@@ -1577,14 +1746,32 @@ fn delete_sessions_blocking(
             continue;
         }
 
-        match delete_session_from_meta(&entry.context, &session) {
+        resolved.push((trimmed_source_path.to_string(), entry, session));
+    }
+
+    // A cleanup target is read from the very rollout that is about to be removed,
+    // so it has to be resolved while those rollouts are still there. A session
+    // whose deletion then fails needs no special case: its rollout stays on disk,
+    // and the cleanup skips any directory a rollout still records.
+    let cleanup_requests = if cleanup.is_empty() {
+        Vec::new()
+    } else {
+        let source_paths: Vec<String> = resolved
+            .iter()
+            .map(|(_, _, session)| session.source_path.clone())
+            .collect();
+        codex_scratch::delete_requests(&contexts, &source_paths)
+    };
+
+    for (source_path, entry, session) in &resolved {
+        match delete_session_from_meta(&entry.context, session) {
             Ok(()) => {
                 deleted_count += 1;
                 invalidate_cache(&entry.context);
             }
             Err(error) => {
                 failed_items.push(DeleteSessionFailure {
-                    source_path: trimmed_source_path.to_string(),
+                    source_path: source_path.clone(),
                     error,
                 });
             }
@@ -1594,6 +1781,7 @@ fn delete_sessions_blocking(
     DeleteToolSessionsResult {
         deleted_count,
         failed_items,
+        cleanup: run_codex_cleanup(cleanup_requests, cleanup),
     }
 }
 
@@ -2103,8 +2291,12 @@ fn rename_session_blocking(
             invalidate_cache(&context);
             Ok(())
         }
-        ToolSessionContext::OpenCode { .. } => {
-            open_code::rename_session(&session.source_path, &title)?;
+        ToolSessionContext::OpenCode { config_path, .. } => {
+            open_code::rename_session(
+                &session.source_path,
+                &title,
+                opencode_reads_v2(config_path),
+            )?;
             invalidate_cache(&context);
             Ok(())
         }
@@ -2260,10 +2452,11 @@ fn scan_sessions(context: &ToolSessionContext) -> Vec<SessionMeta> {
         ToolSessionContext::GeminiCli { tmp_root } => gemini_cli::scan_sessions(tmp_root),
         ToolSessionContext::OpenClaw { agents_root } => open_claw::scan_sessions(agents_root),
         ToolSessionContext::OpenCode {
+            config_path,
             data_root,
             sqlite_db_path,
             ..
-        } => open_code::scan_sessions(data_root, sqlite_db_path),
+        } => open_code::scan_sessions(data_root, sqlite_db_path, opencode_reads_v2(config_path)),
         ToolSessionContext::Pi { sessions_root } => pi::scan_sessions(sessions_root),
         ToolSessionContext::OhMyPi { sessions_root } => oh_my_pi::scan_sessions(sessions_root),
         ToolSessionContext::Grok { sessions_root } => grok::scan_sessions(sessions_root),
@@ -2298,10 +2491,16 @@ fn scan_recent_sessions(context: &ToolSessionContext, limit: usize) -> Vec<Sessi
             open_claw::scan_recent_sessions(agents_root, limit)
         }
         ToolSessionContext::OpenCode {
+            config_path,
             data_root,
             sqlite_db_path,
             ..
-        } => open_code::scan_recent_sessions(data_root, sqlite_db_path, limit),
+        } => open_code::scan_recent_sessions(
+            data_root,
+            sqlite_db_path,
+            limit,
+            opencode_reads_v2(config_path),
+        ),
         ToolSessionContext::Pi { sessions_root } => pi::scan_recent_sessions(sessions_root, limit),
         ToolSessionContext::OhMyPi { sessions_root } => {
             oh_my_pi::scan_recent_sessions(sessions_root, limit)
@@ -2341,7 +2540,9 @@ fn load_messages(
         ToolSessionContext::ClaudeCode { .. } => claude_code::load_messages(Path::new(source_path)),
         ToolSessionContext::GeminiCli { .. } => gemini_cli::load_messages(Path::new(source_path)),
         ToolSessionContext::OpenClaw { .. } => open_claw::load_messages(Path::new(source_path)),
-        ToolSessionContext::OpenCode { .. } => open_code::load_messages(source_path),
+        ToolSessionContext::OpenCode { config_path, .. } => {
+            open_code::load_messages(source_path, opencode_reads_v2(config_path))
+        }
         ToolSessionContext::Pi { .. } => pi::load_messages(Path::new(source_path)),
         ToolSessionContext::OhMyPi { .. } => oh_my_pi::load_messages(Path::new(source_path)),
         ToolSessionContext::Grok { .. } => grok::load_messages(Path::new(source_path)),
@@ -2478,9 +2679,11 @@ fn scan_session_content_for_query(
         ToolSessionContext::OpenClaw { .. } => {
             open_claw::scan_messages_for_query(Path::new(source_path), query_lower)
         }
-        ToolSessionContext::OpenCode { .. } => {
-            open_code::scan_messages_for_query(source_path, query_lower)
-        }
+        ToolSessionContext::OpenCode { config_path, .. } => open_code::scan_messages_for_query(
+            source_path,
+            query_lower,
+            opencode_reads_v2(config_path),
+        ),
         ToolSessionContext::Pi { .. } => {
             pi::scan_messages_for_query(Path::new(source_path), query_lower)
         }
@@ -3302,7 +3505,10 @@ mod tests {
 
     #[test]
     fn session_time_range_parse_accepts_presets_and_rejects_unknown() {
-        assert_eq!(SessionTimeRange::parse(None).unwrap(), SessionTimeRange::All);
+        assert_eq!(
+            SessionTimeRange::parse(None).unwrap(),
+            SessionTimeRange::All
+        );
         assert_eq!(
             SessionTimeRange::parse(Some(String::new())).unwrap(),
             SessionTimeRange::All
@@ -3348,7 +3554,10 @@ mod tests {
         assert_eq!(last30.min_ts, Some(now_ms - 30 * DAY_MS));
         assert!(last30.max_ts.is_none());
         assert!(older30.min_ts.is_none());
-        assert_eq!(older30.max_ts, last30.min_ts, "the two views share one cutoff");
+        assert_eq!(
+            older30.max_ts, last30.min_ts,
+            "the two views share one cutoff"
+        );
     }
 
     #[test]
@@ -3361,7 +3570,10 @@ mod tests {
         let older30 = SessionTimeRange::OlderThan30Days.bounds(now_ms);
 
         // Exactly on the cutoff: inside "last 30 days", outside "older than 30 days".
-        assert!(session_activity_in_range(&time_filter_meta(Some(cutoff)), last30.as_ref()));
+        assert!(session_activity_in_range(
+            &time_filter_meta(Some(cutoff)),
+            last30.as_ref()
+        ));
         assert!(!session_activity_in_range(
             &time_filter_meta(Some(cutoff)),
             older30.as_ref()
@@ -3379,8 +3591,14 @@ mod tests {
         // and stay visible under `all`.
         assert!(session_activity_in_range(&time_filter_meta(None), None));
         assert!(session_activity_in_range(&time_filter_meta(Some(0)), None));
-        assert!(!session_activity_in_range(&time_filter_meta(None), last30.as_ref()));
-        assert!(!session_activity_in_range(&time_filter_meta(Some(0)), older30.as_ref()));
+        assert!(!session_activity_in_range(
+            &time_filter_meta(None),
+            last30.as_ref()
+        ));
+        assert!(!session_activity_in_range(
+            &time_filter_meta(Some(0)),
+            older30.as_ref()
+        ));
     }
 
     #[test]
@@ -3986,9 +4204,11 @@ mod tests {
                 .items
                 .iter()
                 .filter(|session| {
-                    index.selected_path(&session.session_id).is_some_and(|selected| {
-                        codex_rollout::same_rollout_path(selected, &session.source_path)
-                    })
+                    index
+                        .selected_path(&session.session_id)
+                        .is_some_and(|selected| {
+                            codex_rollout::same_rollout_path(selected, &session.source_path)
+                        })
                 })
                 .count();
             println!("rows whose path came from the database: {database_decided}");
@@ -4276,6 +4496,7 @@ mod tests {
                 missing_session_path.to_string_lossy().to_string(),
                 another_session_path.to_string_lossy().to_string(),
             ],
+            CodexCleanupOptions::default(),
         );
 
         assert_eq!(result.deleted_count, 2);
@@ -4287,6 +4508,339 @@ mod tests {
         assert!(result.failed_items[0].error.contains("Session not found"));
         assert!(!existing_session_path.exists());
         assert!(!another_session_path.exists());
+    }
+
+    /// A `[projects]` trust entry, quoted the way Codex writes one (a literal
+    /// string, so a Windows key does not need its backslashes escaped).
+    fn codex_trust_entry(path: &str) -> String {
+        format!("[projects.'{path}']\ntrust_level = \"trusted\"\n\n")
+    }
+
+    /// A rollout carrying a thread id and the working directory Codex recorded.
+    fn codex_rollout_record(thread_id: &str, cwd: &std::path::Path) -> String {
+        json!({
+            "timestamp": "2026-09-25T10:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "timestamp": "2026-09-25T10:00:00Z",
+                "cwd": cwd.to_string_lossy().to_string(),
+            }
+        })
+        .to_string()
+    }
+
+    /// The user-path regression for issue #400: deleting a Codex project-less
+    /// chat can take its generated workspace and its `[projects]` trust entry,
+    /// while a real project's directory and trust entry stay untouched.
+    #[test]
+    fn codex_cleanup_removes_the_scratch_workspace_and_trust_entry_only() {
+        let test_root = TestDir::new("codex-cleanup-lifecycle");
+        let codex_home = test_root.path().join("codex-home");
+        let sessions_root = codex_home.join("sessions");
+
+        // A project-less chat's workspace, exactly where Codex puts it.
+        let workspace = test_root
+            .path()
+            .join("Documents")
+            .join("Codex")
+            .join("2026-09-25")
+            .join("xi");
+        fs::create_dir_all(&workspace).expect("failed to create scratch workspace");
+        fs::write(workspace.join("note.md"), b"scratch").expect("failed to write workspace file");
+
+        // A real project the user also trusts: neither may be touched.
+        let project_dir = test_root.path().join("codex-project");
+        fs::create_dir_all(&project_dir).expect("failed to create project dir");
+        fs::write(project_dir.join("main.rs"), b"fn main() {}")
+            .expect("failed to write project file");
+
+        let config_path = codex_home.join("config.toml");
+        write_text_file(
+            &config_path,
+            &format!(
+                "{}{}",
+                codex_trust_entry(&workspace.to_string_lossy()),
+                codex_trust_entry(&project_dir.to_string_lossy())
+            ),
+        );
+
+        let rollout = sessions_root
+            .join("2026")
+            .join("09")
+            .join("25")
+            .join("rollout-2026-09-25T10-00-00-01a08e7d-5f4b-7c31-9a20-6d3f11b91882.jsonl");
+        write_text_file(
+            &rollout,
+            &codex_rollout_record("01a08e7d-5f4b-7c31-9a20-6d3f11b91882", &workspace),
+        );
+
+        let result = delete_session_blocking(
+            single_context_set(ToolSessionContext::Codex {
+                sessions_root: sessions_root.clone(),
+                codex_home: Some(codex_home.clone()),
+            }),
+            rollout.to_string_lossy().to_string(),
+            CodexCleanupOptions {
+                remove_workspace: true,
+                remove_trust_entry: true,
+            },
+        )
+        .expect("delete should succeed");
+
+        assert!(!rollout.exists());
+        assert!(!workspace.exists(), "the scratch workspace should be gone");
+        assert!(
+            !test_root
+                .path()
+                .join("Documents")
+                .join("Codex")
+                .join("2026-09-25")
+                .exists(),
+            "the emptied date directory should be pruned"
+        );
+        assert!(
+            test_root.path().join("Documents").join("Codex").exists(),
+            "the Codex root itself stays"
+        );
+        assert!(
+            project_dir.join("main.rs").exists(),
+            "a real project directory must survive"
+        );
+
+        let written = fs::read_to_string(&config_path).expect("config should be readable");
+        assert!(
+            !written.contains(&workspace.to_string_lossy().to_string()),
+            "the scratch trust entry should be gone: {written}"
+        );
+        assert!(
+            written.contains(&project_dir.to_string_lossy().to_string()),
+            "a real project's trust entry stays: {written}"
+        );
+
+        let cleanup = result.cleanup.expect("cleanup should be reported");
+        assert_eq!(cleanup.removed_workspaces.len(), 1);
+        assert_eq!(cleanup.removed_trust_keys.len(), 1);
+        assert!(
+            cleanup.failures.is_empty(),
+            "unexpected failures: {:?}",
+            cleanup.failures
+        );
+    }
+
+    /// A workspace another rollout still records as its `cwd` is not residue:
+    /// deleting one of two sessions that share it must leave it in place, and the
+    /// reason must be reported.
+    #[test]
+    fn codex_cleanup_skips_a_workspace_another_session_still_uses() {
+        let test_root = TestDir::new("codex-cleanup-shared-workspace");
+        let codex_home = test_root.path().join("codex-home");
+        let sessions_root = codex_home.join("sessions");
+        let workspace = test_root
+            .path()
+            .join("Documents")
+            .join("Codex")
+            .join("2026-09-25")
+            .join("shared");
+
+        let context = ToolSessionContext::Codex {
+            sessions_root: sessions_root.clone(),
+            codex_home: Some(codex_home.clone()),
+        };
+        let first = sessions_root
+            .join("2026")
+            .join("09")
+            .join("25")
+            .join("rollout-2026-09-25T10-00-00-01a08e7d-5f4b-7c31-9a20-6d3f11b91882.jsonl");
+        let second = sessions_root
+            .join("2026")
+            .join("09")
+            .join("25")
+            .join("rollout-2026-09-25T11-00-00-01a08e11-2c7d-7b55-8e10-4a9c77d20453.jsonl");
+        write_text_file(
+            &first,
+            &codex_rollout_record("01a08e7d-5f4b-7c31-9a20-6d3f11b91882", &workspace),
+        );
+        write_text_file(
+            &second,
+            &codex_rollout_record("01a08e11-2c7d-7b55-8e10-4a9c77d20453", &workspace),
+        );
+        fs::create_dir_all(&workspace).expect("failed to create scratch workspace");
+
+        let options = CodexCleanupOptions {
+            remove_workspace: true,
+            remove_trust_entry: true,
+        };
+
+        let result = delete_session_blocking(
+            single_context_set(context.clone()),
+            first.to_string_lossy().to_string(),
+            options,
+        )
+        .expect("delete should succeed");
+        let cleanup = result.cleanup.expect("cleanup should be reported");
+        assert!(cleanup.removed_workspaces.is_empty());
+        assert!(
+            cleanup
+                .skipped
+                .iter()
+                .any(|skip| skip.reason.contains("another Codex session")),
+            "unexpected skips: {:?}",
+            cleanup.skipped
+        );
+        assert!(workspace.exists(), "a shared workspace must survive");
+
+        // Once the last session is gone the workspace is residue.
+        let result = delete_session_blocking(
+            single_context_set(context),
+            second.to_string_lossy().to_string(),
+            options,
+        )
+        .expect("delete should succeed");
+        let cleanup = result.cleanup.expect("cleanup should be reported");
+        assert_eq!(cleanup.removed_workspaces.len(), 1);
+        assert!(!workspace.exists());
+    }
+
+    /// Auxiliary cleanup failures are reported on their own: the deletion itself
+    /// already succeeded and must not be reported as a failure.
+    #[test]
+    fn codex_cleanup_failure_does_not_fail_the_delete() {
+        let test_root = TestDir::new("codex-cleanup-failure");
+        let codex_home = test_root.path().join("codex-home");
+        let sessions_root = codex_home.join("sessions");
+        let workspace = test_root
+            .path()
+            .join("Documents")
+            .join("Codex")
+            .join("2026-09-25")
+            .join("xi");
+        fs::create_dir_all(&workspace).expect("failed to create scratch workspace");
+
+        // An unparsable config.toml: the trust entry cannot be resolved.
+        write_text_file(
+            &codex_home.join("config.toml"),
+            "this is not = valid toml\n",
+        );
+
+        let rollout = sessions_root
+            .join("2026")
+            .join("09")
+            .join("25")
+            .join("rollout-2026-09-25T10-00-00-01a08e7d-5f4b-7c31-9a20-6d3f11b91882.jsonl");
+        write_text_file(
+            &rollout,
+            &codex_rollout_record("01a08e7d-5f4b-7c31-9a20-6d3f11b91882", &workspace),
+        );
+
+        let result = delete_session_blocking(
+            single_context_set(ToolSessionContext::Codex {
+                sessions_root,
+                codex_home: Some(codex_home),
+            }),
+            rollout.to_string_lossy().to_string(),
+            CodexCleanupOptions {
+                remove_workspace: true,
+                remove_trust_entry: true,
+            },
+        )
+        .expect("the session delete itself must succeed");
+
+        assert!(!rollout.exists());
+        assert!(!workspace.exists(), "workspace removal is independent");
+
+        let cleanup = result.cleanup.expect("cleanup should be reported");
+        assert_eq!(cleanup.removed_workspaces.len(), 1);
+        assert!(
+            !cleanup.failures.is_empty(),
+            "the unparsable config must be reported"
+        );
+    }
+
+    /// The batch path reads its cleanup targets from the same rollouts it is
+    /// about to delete, so a bulk delete has to clean up exactly as completely as
+    /// a single one.
+    #[test]
+    fn codex_cleanup_runs_for_a_bulk_delete() {
+        let test_root = TestDir::new("codex-cleanup-bulk");
+        let codex_home = test_root.path().join("codex-home");
+        let sessions_root = codex_home.join("sessions");
+        let date_dir = test_root
+            .path()
+            .join("Documents")
+            .join("Codex")
+            .join("2026-09-25");
+        let first_workspace = date_dir.join("xi");
+        let second_workspace = date_dir.join("yi");
+        fs::create_dir_all(&first_workspace).expect("failed to create scratch workspace");
+        fs::create_dir_all(&second_workspace).expect("failed to create scratch workspace");
+
+        let config_path = codex_home.join("config.toml");
+        write_text_file(
+            &config_path,
+            &format!(
+                "{}{}",
+                codex_trust_entry(&first_workspace.to_string_lossy()),
+                codex_trust_entry(&second_workspace.to_string_lossy())
+            ),
+        );
+
+        let first = sessions_root
+            .join("2026")
+            .join("09")
+            .join("25")
+            .join("rollout-2026-09-25T10-00-00-01a08e7d-5f4b-7c31-9a20-6d3f11b91882.jsonl");
+        let second = sessions_root
+            .join("2026")
+            .join("09")
+            .join("25")
+            .join("rollout-2026-09-25T11-00-00-01a08e11-2c7d-7b55-8e10-4a9c77d20453.jsonl");
+        write_text_file(
+            &first,
+            &codex_rollout_record("01a08e7d-5f4b-7c31-9a20-6d3f11b91882", &first_workspace),
+        );
+        write_text_file(
+            &second,
+            &codex_rollout_record("01a08e11-2c7d-7b55-8e10-4a9c77d20453", &second_workspace),
+        );
+
+        let result = delete_sessions_blocking(
+            single_context_set(ToolSessionContext::Codex {
+                sessions_root,
+                codex_home: Some(codex_home),
+            }),
+            vec![
+                first.to_string_lossy().to_string(),
+                second.to_string_lossy().to_string(),
+            ],
+            CodexCleanupOptions {
+                remove_workspace: true,
+                remove_trust_entry: true,
+            },
+        );
+
+        assert_eq!(result.deleted_count, 2);
+        assert!(!first_workspace.exists(), "the first workspace should go");
+        assert!(!second_workspace.exists(), "the second workspace should go");
+        assert!(
+            !date_dir.exists(),
+            "the emptied date directory should be pruned"
+        );
+
+        let cleanup = result.cleanup.expect("cleanup should be reported");
+        assert_eq!(cleanup.removed_workspaces.len(), 2);
+        assert_eq!(cleanup.removed_trust_keys.len(), 2);
+        assert!(
+            cleanup.failures.is_empty(),
+            "unexpected failures: {:?}",
+            cleanup.failures
+        );
+
+        let written = fs::read_to_string(&config_path).expect("config should be readable");
+        assert!(
+            !written.contains("Codex"),
+            "both trust entries should be gone: {written}"
+        );
     }
 
     /// A session another thread replays from must be reported as a per-item failure
@@ -4349,6 +4903,7 @@ mod tests {
                 referenced.to_string_lossy().to_string(),
                 deletable.to_string_lossy().to_string(),
             ],
+            CodexCleanupOptions::default(),
         );
 
         assert_eq!(result.deleted_count, 1, "the unrelated session still goes");
@@ -4516,6 +5071,7 @@ mod tests {
         delete_session_blocking(
             single_context_set(context),
             message_dir.to_string_lossy().to_string(),
+            CodexCleanupOptions::default(),
         )
         .expect("opencode direct delete should succeed without prescan");
 
@@ -4558,6 +5114,7 @@ mod tests {
         delete_session_blocking(
             single_context_set(context),
             missing_message_dir.to_string_lossy().to_string(),
+            CodexCleanupOptions::default(),
         )
         .expect("missing opencode delete should remain idempotent");
     }
@@ -4944,7 +5501,7 @@ mod tests {
             sqlite_db_path: export_env.sqlite_db_path(),
         };
         let source_session =
-            open_code::scan_sessions(&export_data_root, &export_env.sqlite_db_path())
+            open_code::scan_sessions(&export_data_root, &export_env.sqlite_db_path(), false)
                 .into_iter()
                 .find(|session| session.session_id == session_id)
                 .expect("opencode source session should exist");
@@ -5012,14 +5569,14 @@ mod tests {
         drop(import_env_guards);
 
         let imported_sessions =
-            open_code::scan_sessions(&import_env.data_root(), &import_env.sqlite_db_path());
+            open_code::scan_sessions(&import_env.data_root(), &import_env.sqlite_db_path(), false);
         let imported_session = imported_sessions
             .iter()
             .find(|session| session.session_id == session_id)
             .expect("opencode imported session should exist");
         assert_project_dir_eq(imported_session.project_dir.as_deref(), &project_dir);
 
-        let imported_messages = open_code::load_messages(&imported_session.source_path)
+        let imported_messages = open_code::load_messages(&imported_session.source_path, false)
             .expect("load opencode messages");
         assert_eq!(imported_messages.len(), 1);
         assert_eq!(imported_messages[0].content, "OpenCode round trip prompt");
@@ -5175,14 +5732,14 @@ mod tests {
         drop(import_env_guards);
 
         let imported_sessions =
-            open_code::scan_sessions(&import_env.data_root(), &import_env.sqlite_db_path());
+            open_code::scan_sessions(&import_env.data_root(), &import_env.sqlite_db_path(), false);
         let imported_session = imported_sessions
             .iter()
             .find(|session| session.session_id == session_id)
             .expect("opencode imported session should exist");
         assert_project_dir_eq(imported_session.project_dir.as_deref(), &project_dir);
 
-        let imported_messages = open_code::load_messages(&imported_session.source_path)
+        let imported_messages = open_code::load_messages(&imported_session.source_path, false)
             .expect("load opencode raw-import messages");
         assert_eq!(imported_messages.len(), 1);
         assert_eq!(imported_messages[0].content, "OpenCode raw import prompt");
@@ -5273,14 +5830,14 @@ mod tests {
         drop(import_env_guards);
 
         let imported_sessions =
-            open_code::scan_sessions(&import_env.data_root(), &import_env.sqlite_db_path());
+            open_code::scan_sessions(&import_env.data_root(), &import_env.sqlite_db_path(), false);
         let imported_session = imported_sessions
             .iter()
             .find(|session| session.session_id == session_id)
             .expect("recovered opencode imported session should exist");
         assert_eq!(imported_session.title.as_deref(), Some("Recovered Import"));
 
-        let imported_messages = open_code::load_messages(&imported_session.source_path)
+        let imported_messages = open_code::load_messages(&imported_session.source_path, false)
             .expect("load recovered opencode messages");
         assert_eq!(imported_messages.len(), 2);
         assert_eq!(imported_messages[0].content, "Recovered import prompt");
@@ -5372,7 +5929,7 @@ mod tests {
         drop(import_env_guards);
 
         let imported_sessions =
-            open_code::scan_sessions(&import_env.data_root(), &import_env.sqlite_db_path());
+            open_code::scan_sessions(&import_env.data_root(), &import_env.sqlite_db_path(), false);
         let imported_session = imported_sessions
             .iter()
             .find(|session| session.session_id == session_id)
@@ -5382,7 +5939,7 @@ mod tests {
             Some("Recovered Assistant First")
         );
 
-        let imported_messages = open_code::load_messages(&imported_session.source_path)
+        let imported_messages = open_code::load_messages(&imported_session.source_path, false)
             .expect("load assistant-first recovered opencode messages");
         assert_eq!(imported_messages.len(), 1);
         assert_eq!(

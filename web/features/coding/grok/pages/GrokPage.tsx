@@ -75,6 +75,7 @@ import {
   getGrokProviderCatalogModels,
   getGrokProviderDefaultModelKey,
   removeGrokCatalogModel,
+  resolveGrokChannelApiBackend,
   resolveGrokProviderApiFormat,
   toGrokModelFormValues,
   upsertGrokCatalogModel,
@@ -771,7 +772,7 @@ const GrokPage: React.FC = () => {
         }
       })();
       const baseUrl = extractGrokSettingsBaseUrl(settings);
-      const apiBackend = extractGrokSettingsApiBackend(settings);
+      const apiBackend = resolveGrokChannelApiBackend(fetchModelsProvider);
       let models = getGrokProviderCatalogModels(fetchModelsProvider);
       const removed = new Set(result.removedModelIds || []);
       if (removed.size > 0) {
@@ -824,7 +825,7 @@ const GrokPage: React.FC = () => {
       })();
       const nextModel = fromGrokModelFormValues(values, existing, {
         baseUrl: extractGrokSettingsBaseUrl(settings),
-        apiBackend: extractGrokSettingsApiBackend(settings),
+        apiBackend: resolveGrokChannelApiBackend(modelModalProvider),
       });
       const nextModels = upsertGrokCatalogModel(models, nextModel, modelModalKey || undefined);
       const currentDefault = getGrokProviderDefaultModelKey(modelModalProvider);
@@ -1410,6 +1411,9 @@ const GrokPage: React.FC = () => {
             auth: apiKey ? { API_KEY: apiKey } : {},
             config: '',
             ...(defaultModelKey ? { defaultModelKey } : {}),
+            // Channel-level Base URL SoT: a provider imported without models (or whose
+            // model list is later emptied) must not lose the address (issue #391).
+            ...(baseUrl ? { baseUrl } : {}),
             modelCatalog: {
               models: importedModelIds.map((modelId) => ({
                 key: modelId,
@@ -1512,6 +1516,10 @@ const GrokPage: React.FC = () => {
         } else if (values.model) {
           // Custom: fixed local key "custom"; form model name is upstream model ID only.
           settingsConfigObj.defaultModelKey = 'custom';
+          if (values.baseUrl) {
+            // Channel-level SoT, kept in sync with buildGrokSettingsConfig.
+            settingsConfigObj.baseUrl = values.baseUrl;
+          }
           settingsConfigObj.modelCatalog = {
             models: [{
               key: 'custom',
@@ -1648,6 +1656,10 @@ const GrokPage: React.FC = () => {
         } else if (values.model) {
           // Custom: fixed local key "custom"; form model name is upstream model ID only.
           settingsConfigObj.defaultModelKey = 'custom';
+          if (values.baseUrl) {
+            // Channel-level SoT, kept in sync with buildGrokSettingsConfig.
+            settingsConfigObj.baseUrl = values.baseUrl;
+          }
           settingsConfigObj.modelCatalog = {
             models: [{
               key: 'custom',

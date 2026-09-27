@@ -114,7 +114,11 @@
         "cacheCreation": "Cache creation",
         "cacheRead": "Cache read",
         "approximateTokens": "≈ {{value}}",
-        "modelUnavailable": "Model not recorded"
+        "modelUnavailable": "Model not recorded",
+        "unpricedModelsHint": "{{count}} model(s) in this range have no matching model price, so the amount only counts reported or priced usage. Missing pricing does not mean free.",
+        "unpricedModelsAction": "Add model prices",
+        "unpricedModelTag": "No price",
+        "unpricedModelsMore": "and {{count}} more"
       },
       "pricing": {
         "open": "Pricing config",
@@ -158,7 +162,8 @@
         "loadModelFailed": "Failed to load model pricing: {{error}}",
         "saveModelFailed": "Failed to save model pricing: {{error}}",
         "deleteConfirmTitle": "Delete model pricing",
-        "deleteConfirmDesc": "Delete pricing for {{modelId}}?"
+        "deleteConfirmDesc": "Delete pricing for {{modelId}}?",
+        "officialSyncFromMirror": "Primary source unreachable; synced from mirror, {{count}} new rows added"
       },
       "modelHealthState": {
         "healthy": "Healthy"
@@ -274,7 +279,8 @@
           "source": "Data source",
           "allSources": "All sources",
           "proxy": "Gateway",
-          "overviewHint": "Includes gateway and local usage, preferring the gateway for the same invocation. Aggregates retain native granularity; unknown call counts are not inferred, and cumulative usage is attributed to observation time. Cost includes reported amounts and available model price estimates. Missing pricing does not mean free usage."
+          "overviewHint": "Includes gateway and local usage, preferring the gateway for the same invocation. Aggregates retain native granularity; unknown call counts are not inferred, and cumulative usage is attributed to observation time. Cost includes reported amounts and available model price estimates. Missing pricing does not mean free usage.",
+          "costUnavailableHint": "No model price matched this model, so this record is costed at 0. Add a price or sync preset prices from the pricing dialog on the statistics page; the next local usage sync will reprice this session record."
         },
         "websocket": {
           "transport": "Transport",
@@ -1572,6 +1578,7 @@
     "moreOptionsCliNotSet": "No manual CLI path set yet. Click Edit to auto-detect or pick a local CLI path.",
     "apply": "Apply",
     "open": "Open",
+    "openUrl": "Open {{url}}",
     "preferredTerminal": "Preferred Terminal",
     "preferredTerminalHint": "Choose the terminal app used when clicking the terminal button. If the selected terminal is unavailable, the system default terminal is used.",
     "terminalCmd": "Command Prompt",
@@ -1737,7 +1744,17 @@
       "last7Days": "Last 7 days",
       "last30Days": "Last 30 days",
       "older30Days": "Older than 30 days"
-    }
+    },
+    "codexCleanupWorkspace": "Also delete the Codex-generated workspace {{path}}",
+    "codexCleanupWorkspaces": "Also delete the {{count}} Codex-generated workspaces",
+    "codexCleanupWorkspaceEmpty": "Empty directory, safe to remove",
+    "codexCleanupWorkspaceFiles": "Holds {{fileCount}} files ({{nonEmptyCount}} of the directories are not empty); removal cannot be undone",
+    "codexCleanupTrust": "Also remove the trust entry {{key}}",
+    "codexCleanupTrustEntries": "Also remove {{count}} Codex trust entries",
+    "codexCleanupTrustHint": "Only trust entries written for project-less chats are removed; the trust entry of a real project is kept",
+    "codexCleanupSuccess": "Residue cleaned: {{workspaces}} directories, {{trustKeys}} trust entries",
+    "codexCleanupSkipped": "Session deleted, but {{count}} residue item(s) were left ({{target}}: {{reason}})",
+    "codexCleanupFailed": "Session deleted, but {{count}} residue item(s) failed to clean ({{target}}: {{error}})"
   },
   "notes": {
     "title": "Notes"
@@ -2512,6 +2529,13 @@
       "markdownAdvancedHint": "Edit the YAML frontmatter for this Markdown agent. The prompt body is unchanged and unknown fields remain in the current file.",
       "markdownRepairHint": "This Markdown agent cannot be parsed. Repair the YAML frontmatter in the full file; it will be validated again before saving.",
       "markdownPromptEditorHint": "The content will be saved as the Markdown prompt body for {{name}}: {{path}}"
+    },
+    "v2Migration": {
+      "title": "Migrate OpenCode config to V2",
+      "banner": "If OpenCode on this machine is V2, open More options at the top right and turn on Migrate OpenCode config to V2. Until then, this page still reads and writes the local file as V1.",
+      "hint": "Enabling backs up the current file as openvode_v1.<extension> and converts it to V2. Turning it off restores V1 and saves the V2 file as opencode_v2.<extension>.",
+      "enabled": "OpenCode config migrated to V2",
+      "disabled": "OpenCode V1 config restored"
     }
   },
   "claudecode": {
@@ -2862,6 +2886,12 @@
       "apiKeyPlaceholder": "Enter OPENAI_API_KEY",
       "showApiKey": "Show",
       "hideApiKey": "Hide",
+      "requiresOpenaiAuth": "requires_openai_auth",
+      "requiresOpenaiAuthAuto": "Auto (match the auth mechanism)",
+      "requiresOpenaiAuthKeep": "Always write true",
+      "requiresOpenaiAuthStrip": "Always remove",
+      "requiresOpenaiAuthHelp": "Controls whether requires_openai_auth = true is written for this provider in config.toml. Auto follows how the provider authenticates: true for official logins and for a provider whose API key is stored here, removed for keyless relays that manage auth themselves. Choose \"Always write true\" for relays that expect the OpenAI auth token (for example a ChatGPT-subscription proxy).",
+      "requiresOpenaiAuthPreserveHint": "\"Keep official login when switching\" is on. Auto removes requires_openai_auth here because that mode authenticates with the provider bearer token. If your relay accepts the OpenAI auth token (a ChatGPT-subscription proxy, or you need /fast, voice or other account features), choose \"Always write true\": both fields are written, the bearer token stays the credential and requires_openai_auth only enables the account. Choose \"Always remove\" if the relay manages auth on its own.",
       "baseUrl": "Base URL",
       "baseUrlHelp": "Enter the API endpoint URL. OpenAI Chat/Responses-compatible endpoints usually end with /v1 (e.g. https://api.openai.com/v1); Anthropic Messages / Gemini Native depends on the upstream.",
       "baseUrlConfirmV1": "The current Base URL does not end with /v1. OpenAI Chat/Responses-compatible endpoints typically require this suffix. Continue with the current URL?",
@@ -3266,6 +3296,36 @@
         "clearSuccess": "Memories cleared"
       },
       "sourceUnavailableDescription": "The current source is not available on this machine. Switch to an available source."
+    },
+    "scratchResidue": {
+      "menu": "Clean up residue",
+      "title": "Codex project-less chat residue",
+      "description": "Codex creates a workspace and a trust entry for every project-less chat and does not reclaim them when the chat is deleted. The items below are no longer referenced by any Codex session, so they are safe to clean; real project directories never appear here.",
+      "unavailable": "The selected source has no Codex home",
+      "scanIncomplete": "The session scan was incomplete, so nothing can be proven unreferenced; cleanup is disabled.",
+      "workspacesTitle": "Workspaces",
+      "blockedTitle": "Not removable (contains a git repository)",
+      "trustTitle": "Trust entries",
+      "dateDirsTitle": "Empty dated directories",
+      "selectAll": "Select all",
+      "selectNone": "Clear",
+      "workspaceEmpty": "Empty",
+      "workspaceFiles": "{{count}} files · {{size}}",
+      "workspaceGit": "Contains a git repository, treated as a real project and kept",
+      "trustDirExists": "Directory still exists",
+      "trustDirMissing": "Directory is already gone",
+      "empty": "No residue found",
+      "cleanSelected": "Clean selected ({{count}})",
+      "clean": "Clean",
+      "confirmTitle": "Clean the selected residue",
+      "confirmContent": "This removes {{workspaceCount}} directories ({{nonEmptyWorkspaceCount}} of them non-empty), {{trustKeyCount}} trust entries and {{dateDirCount}} empty dated directories. It cannot be undone.",
+      "confirmHint": "Only the selected items are touched: real project directories are never deleted, and trust entries you leave unchecked are left alone.",
+      "cleanSuccess": "Cleaned {{workspaces}} directories, {{trustKeys}} trust entries and {{dateDirs}} empty dated directories",
+      "cleanSkipped": "Cleaned {{workspaces}} directories and {{trustKeys}} trust entries; {{count}} item(s) were skipped ({{target}}: {{reason}})",
+      "cleanFailed": "Cleaned {{workspaces}} directories and {{trustKeys}} trust entries; {{count}} item(s) failed ({{target}}: {{error}})",
+      "partialHint": "The following items were not cleaned as expected; rescan and retry.",
+      "failureItem": "{{target}}: {{error}}",
+      "skipItem": "{{target}}: {{reason}}"
     }
   },
   "geminicli": {

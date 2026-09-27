@@ -326,6 +326,9 @@ impl UpstreamResponse {
     }
 }
 
+const FIRST_CHUNK_PROTOCOL_ERROR_MESSAGE: &str =
+    "Upstream streaming response reported a protocol error envelope";
+
 async fn validate_streaming_first_chunk(
     response: &mut DebugHttpResponse,
     first_byte_timeout_secs: u64,
@@ -362,9 +365,7 @@ async fn validate_streaming_first_chunk(
                             .collect();
                         let snapshot_bytes = snapshot.len() as u64;
                         return Err(GatewayForwardError {
-                            message:
-                                "Upstream streaming response reported a protocol error envelope"
-                                    .to_string(),
+                            message: FIRST_CHUNK_PROTOCOL_ERROR_MESSAGE.to_string(),
                             kind: GatewayFailureKind::UpstreamBadRequest,
                             upstream_request_body: None,
                             upstream_response_body: Some(snapshot),
@@ -410,9 +411,7 @@ async fn validate_streaming_first_chunk(
                             .collect();
                         let snapshot_bytes = snapshot.len() as u64;
                         return Err(GatewayForwardError {
-                            message:
-                                "Upstream streaming response reported a protocol error envelope"
-                                    .to_string(),
+                            message: FIRST_CHUNK_PROTOCOL_ERROR_MESSAGE.to_string(),
                             kind: GatewayFailureKind::UpstreamBadRequest,
                             upstream_request_body: None,
                             upstream_response_body: Some(snapshot),
@@ -1001,8 +1000,8 @@ async fn forward_to_upstream(
     let mut providers = provider_candidates.providers;
 
     // Aggregate routing is shared with the Responses WebSocket transport so
-    // both transports use the same persisted slug table, bare-name ambiguity
-    // policy, and candidate ordering.
+    // HTTP requests use the persisted slug table, bare-name ambiguity policy,
+    // and candidate ordering shared by this request pipeline.
     let mut aggregate_upstream_model: Option<String> = None;
     let mut aggregate_model_is_explicit = false;
     if let Some(selection) = aggregate_selection {
@@ -1192,7 +1191,16 @@ async fn forward_to_upstream(
                                 let failure_kind = error.kind;
                                 let category =
                                     model_health::classify_failure(failure_kind).category;
-                                if !options.disable_health_mutation {
+                                // A protocol failure envelope is a valid HTTP/SSE delivery
+                                // from the selected upstream, not evidence that its model is
+                                // unhealthy. Keep the failure response/category unchanged,
+                                // but do not let repeated 2xx SSE envelopes cool the model.
+                                let is_2xx_sse_protocol_error = failure_kind
+                                    == GatewayFailureKind::UpstreamBadRequest
+                                    && error.message == FIRST_CHUNK_PROTOCOL_ERROR_MESSAGE
+                                    && (200..300).contains(&response.status_code)
+                                    && response_is_sse_header_pairs(&response.headers);
+                                if !options.disable_health_mutation && !is_2xx_sse_protocol_error {
                                     health_changed |=
                                         record_health_failure(context, &health_key, failure_kind);
                                 }
@@ -5215,9 +5223,9 @@ pub(super) struct AggregateRequestCandidates {
 
 /// Resolve one aggregate request into its exact eligible provider order.
 ///
-/// This is the routing source of truth for both HTTP and Responses WebSocket:
-/// the selected site, persisted slug semantics, bare-name ambiguity check, and
-/// cross-site fallback candidates must not drift between transports.
+/// This is the routing source of truth for aggregate HTTP/SSE requests: the
+/// selected site, persisted slug semantics, bare-name ambiguity check, and
+/// cross-site fallback candidates are resolved together before any upstream call.
 pub(super) fn resolve_aggregate_request_candidates(
     requested_model: &str,
     selection: &GatewayProviderSelection,

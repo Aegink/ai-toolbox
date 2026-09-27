@@ -1,6 +1,6 @@
 import React from 'react';
 import { Typography, Button, Space, Empty, message, Modal, Spin, Collapse, Descriptions, Checkbox, Drawer, Input } from 'antd';
-import { PlusOutlined, FolderOpenOutlined, AppstoreOutlined, SyncOutlined, EyeOutlined, ExclamationCircleOutlined, LinkOutlined, EllipsisOutlined, DatabaseOutlined, ImportOutlined, FileTextOutlined, ThunderboltOutlined, EditOutlined, CopyOutlined, MessageOutlined, BulbOutlined, CheckSquareOutlined } from '@ant-design/icons';
+import { PlusOutlined, FolderOpenOutlined, AppstoreOutlined, SyncOutlined, ClearOutlined, EyeOutlined, ExclamationCircleOutlined, LinkOutlined, EllipsisOutlined, DatabaseOutlined, ImportOutlined, FileTextOutlined, ThunderboltOutlined, EditOutlined, CopyOutlined, MessageOutlined, BulbOutlined, CheckSquareOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { listen } from '@tauri-apps/api/event';
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
@@ -77,6 +77,7 @@ import ImportFromAllApiHubModal from '../components/ImportFromAllApiHubModal';
 import CodexPluginsPanel from '../components/CodexPluginsPanel';
 import CodexMemoriesPanel from '../components/CodexMemoriesPanel/CodexMemoriesPanel';
 import CodexHistorySyncModal from '../components/CodexHistorySyncModal';
+import CodexScratchResidueModal from '../components/CodexScratchResidueModal';
 import GatewayAggregateSettings from '@/features/coding/gateway/components/GatewayAggregateSettings';
 import {
   CODEX_LOCAL_PROVIDER_ID,
@@ -162,6 +163,7 @@ import SectionSidebarLayout, {
 import { extractCodexBaseUrl, extractCodexModel } from '@/utils/codexConfigUtils';
 import {
   buildCodexSettingsConfig,
+  normalizeCodexRequiresOpenaiAuthMode,
   parseCodexSettingsConfig,
   resolveCodexAutoReviewModelOverride,
 } from '../utils/codexSettingsConfig';
@@ -470,6 +472,7 @@ const CodexPage: React.FC = () => {
   const [providerModalMode, setProviderModalMode] = React.useState<'manual' | 'import'>('manual');
   const [commonConfigModalOpen, setCommonConfigModalOpen] = React.useState(false);
   const [historySyncModalOpen, setHistorySyncModalOpen] = React.useState(false);
+  const [scratchResidueModalOpen, setScratchResidueModalOpen] = React.useState(false);
   const [conflictDialogOpen, setConflictDialogOpen] = React.useState(false);
   const [conflictInfo, setConflictInfo] = React.useState<ImportConflictInfo | null>(null);
   const [pendingFormValues, setPendingFormValues] = React.useState<CodexProviderFormValues | null>(null);
@@ -1173,6 +1176,13 @@ const CodexPage: React.FC = () => {
     const autoReviewModelOverride = options?.autoReviewModelOverride === undefined
       ? resolveCodexAutoReviewModelOverride(settings)
       : (options.autoReviewModelOverride?.trim() || undefined);
+    // Catalog-only edits rebuild the whole settingsConfig, so the explicit
+    // `requires_openai_auth` override must be carried through explicitly —
+    // otherwise any model add/remove/reorder would silently reset it to auto
+    // (issue #394).
+    const requiresOpenaiAuthMode = normalizeCodexRequiresOpenaiAuthMode(
+      settings.requiresOpenaiAuthMode,
+    );
     const settingsConfig = buildCodexSettingsConfig({
       category: provider.category,
       apiKey: settings.auth?.OPENAI_API_KEY || '',
@@ -1182,6 +1192,7 @@ const CodexPage: React.FC = () => {
       config: settings.config || '',
       catalogModels: models,
       autoReviewModelOverride,
+      requiresOpenaiAuthMode,
       auth: settings.auth ?? {},
     });
 
@@ -1816,7 +1827,6 @@ const CodexPage: React.FC = () => {
           '[model_providers.custom]',
           'name = "OpenAI"',
           'wire_api = "responses"',
-          'requires_openai_auth = true',
         ];
 
         if (baseUrl) {
@@ -1975,6 +1985,12 @@ const CodexPage: React.FC = () => {
               };
 
         if (values.category !== 'official') {
+          const requiresOpenaiAuthMode = normalizeCodexRequiresOpenaiAuthMode(
+            values.requiresOpenaiAuthMode,
+          );
+          if (requiresOpenaiAuthMode) {
+            settingsConfigObj.requiresOpenaiAuthMode = requiresOpenaiAuthMode;
+          }
           const configParts: string[] = [];
           if (values.baseUrl) {
             configParts.push(`base_url = "${values.baseUrl}"`);
@@ -2134,6 +2150,12 @@ const CodexPage: React.FC = () => {
               };
 
         if (values.category !== 'official') {
+          const requiresOpenaiAuthMode = normalizeCodexRequiresOpenaiAuthMode(
+            values.requiresOpenaiAuthMode,
+          );
+          if (requiresOpenaiAuthMode) {
+            settingsConfigObj.requiresOpenaiAuthMode = requiresOpenaiAuthMode;
+          }
           const configParts: string[] = [];
           if (values.baseUrl) {
             configParts.push(`base_url = "${values.baseUrl}"`);
@@ -2785,18 +2807,32 @@ const CodexPage: React.FC = () => {
             sourceMode={sessionSourceMode}
             onSourceModeChange={handleSessionSourceModeChange}
             extra={(
-              <Button
-                type="link"
-                size="small"
-                style={{ fontSize: 12 }}
-                icon={<SyncOutlined />}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  setHistorySyncModalOpen(true);
-                }}
-              >
-                {t('codex.historySync.menu')}
-              </Button>
+              <>
+                <Button
+                  type="link"
+                  size="small"
+                  style={{ fontSize: 12 }}
+                  icon={<SyncOutlined />}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setHistorySyncModalOpen(true);
+                  }}
+                >
+                  {t('codex.historySync.menu')}
+                </Button>
+                <Button
+                  type="link"
+                  size="small"
+                  style={{ fontSize: 12 }}
+                  icon={<ClearOutlined />}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setScratchResidueModalOpen(true);
+                  }}
+                >
+                  {t('codex.scratchResidue.menu')}
+                </Button>
+              </>
             )}
           />
         </div>
@@ -2904,6 +2940,7 @@ const CodexPage: React.FC = () => {
             provider={editingProvider}
             isCopy={isCopyMode}
             mode={providerModalMode}
+            preserveOfficialAuthOnSwitch={codexPreserveOfficialAuthOnSwitch}
             onCancel={() => {
               setProviderModalOpen(false);
               setEditingProvider(null);
@@ -2929,6 +2966,12 @@ const CodexPage: React.FC = () => {
           onCancel={() => setRootDirectoryModalOpen(false)}
           onSubmit={handleSaveRootDirectory}
           onReset={handleResetRootDirectory}
+        />
+
+        <CodexScratchResidueModal
+          open={scratchResidueModalOpen}
+          onClose={() => setScratchResidueModalOpen(false)}
+          sourceMode={sessionSourceMode}
         />
 
         <CodexHistorySyncModal

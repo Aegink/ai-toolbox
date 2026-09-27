@@ -456,6 +456,7 @@ pub struct ProxyGatewaySettings {
 const DEFAULT_GATEWAY_LISTEN_PORT: u16 = 37123;
 const GATEWAY_LISTEN_PORT_ENV: &str = "AI_TOOLBOX_GATEWAY_PORT";
 
+#[cfg(test)]
 fn configured_gateway_listen_port(value: Option<&str>) -> u16 {
     value
         .map(str::trim)
@@ -467,8 +468,23 @@ fn configured_gateway_listen_port(value: Option<&str>) -> u16 {
         .unwrap_or(DEFAULT_GATEWAY_LISTEN_PORT)
 }
 
+/// Valid `AI_TOOLBOX_GATEWAY_PORT` override, if the isolated launcher set one.
+///
+/// Unlike [`configured_gateway_listen_port`] this keeps "unset/invalid" distinct
+/// from the production default: callers that force the port on top of a
+/// persisted gateway record must not overwrite a user's stored port with 37123
+/// just because the env value was malformed.
+pub(crate) fn configured_gateway_listen_port_override() -> Option<u16> {
+    let value = std::env::var(GATEWAY_LISTEN_PORT_ENV).ok()?;
+    value
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port >= 1024)
+}
+
 fn default_gateway_listen_port() -> u16 {
-    configured_gateway_listen_port(std::env::var(GATEWAY_LISTEN_PORT_ENV).ok().as_deref())
+    configured_gateway_listen_port_override().unwrap_or(DEFAULT_GATEWAY_LISTEN_PORT)
 }
 
 impl Default for ProxyGatewaySettings {
@@ -987,6 +1003,15 @@ pub struct GatewayModelStats {
     pub avg_latency_ms: Option<u64>,
     /// Token-weighted input cache hit ratio (0..=1); None when input usage is absent.
     pub cache_hit_rate: Option<f64>,
+    /// Whether the pricing table can price this model id at all, decided by the
+    /// same matcher the write path and the session cost reconciliation use.
+    ///
+    /// `false` means no cost can be derived from `model_pricing`, so native
+    /// (session) usage for this model lands at `0`; it does **not** mean the
+    /// model is free. `true` does not promise a non-zero amount either: rows
+    /// already stored are only requoted by the session cost reconciliation, not
+    /// by pricing CRUD.
+    pub has_pricing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

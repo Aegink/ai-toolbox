@@ -50,7 +50,9 @@ export interface ApplyGrokEndpointSettingsConfigInput {
   endpointCatalogModels: GrokCatalogModel[];
 }
 
-function mapGrokApiFormatToBackend(apiFormat?: GrokApiFormat): string {
+/** Channel API format → live `api_backend` token. Single source for both directions
+ * (the reverse mapping lives in `grokProviderModels.mapGrokApiBackendToApiFormat`). */
+export function mapGrokApiFormatToBackend(apiFormat?: GrokApiFormat): string {
   if (apiFormat === 'openai_responses') {
     return 'responses';
   }
@@ -299,6 +301,12 @@ export function buildGrokSettingsConfig({
     settingsConfig.defaultReasoningEffort = normalizedReasoningEffort;
   }
   if (category === 'custom') {
+    // Channel-level Base URL SoT. The catalog projection above is what reaches the
+    // live `[model.<key>].base_url`, but only this field survives model-list
+    // mutations (issue #391). Official channels have no Base URL.
+    if (normalizedBaseUrl) {
+      settingsConfig.baseUrl = normalizedBaseUrl;
+    }
     settingsConfig.modelCatalog = {
       models: normalizedCatalogModels,
     };
@@ -356,6 +364,9 @@ export function applyGrokEndpointSettingsConfig({
 
   return JSON.stringify({
     ...parsed,
+    // Keep the channel-level SoT in sync with the endpoint finalization so built-in
+    // channels also survive model-list mutations (issue #391).
+    ...(normalizedBaseUrl ? { baseUrl: normalizedBaseUrl } : {}),
     defaultModelKey,
     modelCatalog: {
       models: normalizedCatalogModels,

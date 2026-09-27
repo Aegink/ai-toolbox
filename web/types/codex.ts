@@ -91,7 +91,23 @@ export interface CodexSettingsConfig {
    * uses this slug instead of the default codex-auto-review.
    */
   autoReviewModelOverride?: string;
+  /**
+   * Explicit override for the generated `requires_openai_auth` line (issue #394).
+   * Omitted means "derive it from the auth mechanism"; an absent key *is* auto,
+   * so `auto` is never stored. Only meaningful for `custom` providers — official
+   * ones are always automatic.
+   */
+  requiresOpenaiAuthMode?: CodexRequiresOpenaiAuthMode;
 }
+
+/**
+ * Explicit `requires_openai_auth` override stored on a custom provider.
+ * `keep`/`strip` win over the automatic auth-mechanism rule.
+ */
+export type CodexRequiresOpenaiAuthMode = 'keep' | 'strip';
+
+/** The provider form's three-way selection; `auto` normalizes to an absent key. */
+export type CodexRequiresOpenaiAuthModeSelection = 'auto' | CodexRequiresOpenaiAuthMode;
 
 /**
  * Codex Provider stored in database
@@ -362,6 +378,8 @@ export interface CodexProviderFormValues {
   category: CodexProviderCategory;
   // 新架构：直接使用 settingsConfig（JSON 字符串）
   settingsConfig?: string;
+  /** Explicit `requires_openai_auth` override; `auto` keeps deriving it. */
+  requiresOpenaiAuthMode?: CodexRequiresOpenaiAuthModeSelection;
   // 旧架构（向后兼容）
   providerEndpointKey?: string;
   providerProfileId?: string;
@@ -455,4 +473,67 @@ export interface CodexMemoryFileContent {
   content: string;
   size: number;
   modifiedAtMs?: number | null;
+}
+
+/**
+ * Codex project-less ("scratch") chat residue (issue #400).
+ *
+ * Codex creates a workspace directory and a `[projects]` trust entry for every
+ * chat started without a project, and reclaims neither when the chat is deleted.
+ */
+export interface CodexScratchWorkspaceInfo {
+  path: string;
+  exists: boolean;
+  isEmpty: boolean;
+  fileCount: number;
+  totalBytes: number;
+  hasGit: boolean;
+  truncated: boolean;
+}
+
+export interface CodexScratchResidueWorkspace {
+  info: CodexScratchWorkspaceInfo;
+  runtimeSource: 'local' | 'wsl';
+  runtimeDistro?: string | null;
+}
+
+export interface CodexScratchResidueTrustEntry {
+  key: string;
+  configPath: string;
+  dirExists: boolean;
+  runtimeSource: 'local' | 'wsl';
+  runtimeDistro?: string | null;
+}
+
+export interface CodexScratchResidue {
+  source: CodexHistorySourceMode;
+  /** The requested source has no Codex home on this machine. */
+  unavailable: boolean;
+  /**
+   * `false` when the rollout scan could not prove that a directory is
+   * unreferenced. Cleanup must not be offered in that case.
+   */
+  scanComplete: boolean;
+  configPaths: string[];
+  workspaces: CodexScratchResidueWorkspace[];
+  trustEntries: CodexScratchResidueTrustEntry[];
+  emptyDateDirs: string[];
+}
+
+export interface CodexScratchCleanSkip {
+  target: string;
+  reason: string;
+}
+
+export interface CodexScratchCleanFailure {
+  target: string;
+  error: string;
+}
+
+export interface CodexScratchCleanResult {
+  removedWorkspaces: string[];
+  removedTrustKeys: string[];
+  removedDateDirs: string[];
+  skipped: CodexScratchCleanSkip[];
+  failures: CodexScratchCleanFailure[];
 }

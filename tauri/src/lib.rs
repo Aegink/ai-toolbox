@@ -82,7 +82,9 @@ mod app_identity_tests {
 /// returns `None` for any window that is not a single-webview window
 /// (`Window::is_webview_window()`). Callers that only need window-level
 /// behaviour (show / hide / focus / size / position) must use this helper.
-pub(crate) fn main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<tauri::Window<R>> {
+pub(crate) fn main_window<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Option<tauri::Window<R>> {
     app.get_window("main")
 }
 
@@ -2257,6 +2259,8 @@ pub fn run() {
             coding::proxy_gateway::provider_profiles::load_cached_gateway_provider_profiles,
             // OpenCode
             coding::open_code::get_opencode_config_path,
+            coding::open_code::get_opencode_v2_config_mode,
+            coding::open_code::set_opencode_v2_config_mode,
             coding::open_code::get_opencode_config_path_info,
             coding::open_code::read_opencode_config,
             coding::open_code::get_opencode_preview,
@@ -2297,6 +2301,9 @@ pub fn run() {
             coding::session_manager::get_tool_subagent_session_detail,
             coding::session_manager::delete_tool_session,
             coding::session_manager::delete_tool_sessions,
+            coding::session_manager::preview_codex_session_cleanup,
+            coding::session_manager::scan_codex_scratch_residue,
+            coding::session_manager::clean_codex_scratch_residue,
             coding::session_manager::export_tool_session,
             coding::session_manager::export_tool_sessions,
             coding::session_manager::import_tool_session,

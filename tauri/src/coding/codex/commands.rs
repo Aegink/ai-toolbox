@@ -42,7 +42,14 @@ use crate::http_client;
 use chrono::Local;
 use tauri::{Emitter, Runtime};
 
-const PROTECTED_TOP_LEVEL_TOML_KEYS: [&str; 2] = ["mcp_servers", "plugins"];
+/// Runtime-owned `config.toml` sections AI Toolbox never manages.
+///
+/// `projects` is Codex's own trust map (`[projects."<dir>"] trust_level`): it is
+/// written by Codex, read by Codex, and cleanup of the project-less chat entries
+/// in it is a separate, explicitly requested operation
+/// (`coding::codex::scratch_workspace`). A provider or common-config rewrite must
+/// never drop or re-project it.
+const PROTECTED_TOP_LEVEL_TOML_KEYS: [&str; 3] = ["mcp_servers", "plugins", "projects"];
 const PROTECTED_FEATURE_TOML_KEYS: [&str; 1] = ["plugins"];
 const CODEX_NO_LOCAL_PROVIDER_CONFIG_ERROR: &str = "No config files found";
 const CODEX_MODEL_CATALOG_URLS: [&str; 2] = [
@@ -1520,10 +1527,21 @@ async fn load_local_codex_provider_snapshot(
         String::new()
     };
 
-    let settings = serde_json::json!({
+    // Capture a hand-tuned live `requires_openai_auth` as an explicit mode before
+    // the stored TOML drops the projection-owned line (issue #394).
+    let requires_openai_auth_mode = codex_requires_openai_auth_mode_from_config_toml(&config_toml);
+    let mut settings = serde_json::json!({
         "auth": auth,
         "config": config_toml
     });
+    if let Some(mode) = requires_openai_auth_mode.as_storage_str() {
+        if let Some(settings_object) = settings.as_object_mut() {
+            settings_object.insert(
+                CODEX_REQUIRES_OPENAI_AUTH_MODE_KEY.to_string(),
+                serde_json::Value::String(mode.to_string()),
+            );
+        }
+    }
     let stored_common_toml = if let Some(db) = db {
         get_codex_common_toml(db).await?
     } else {
@@ -1945,6 +1963,96 @@ fn remove_codex_experimental_bearer_token(config_toml: &str) -> Result<String, S
     Ok(document.to_string())
 }
 
+/// Explicit per-provider override for `requires_openai_auth` (issue #394).
+///
+/// The projection normally derives the flag from the provider's auth mechanism.
+/// This lets a user state the intent directly instead. The motivating case is a
+/// third-party relay (a `/backend-api/codex`-style path) that consumes the
+/// ChatGPT OAuth token from `auth.json`: it needs the flag but carries no managed
+/// API key, so the automatic rule classified it as keyless and stripped the flag
+/// with no way to opt back in.
+///
+/// `Auto` is the absence of the stored key, so pre-existing providers are
+/// unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequiresOpenaiAuthMode {
+    Auto,
+    Keep,
+    Strip,
+}
+
+impl RequiresOpenaiAuthMode {
+    /// Canonical stored value. `Auto` has none by design: it is represented by
+    /// the key being absent.
+    fn as_storage_str(self) -> Option<&'static str> {
+        match self {
+            RequiresOpenaiAuthMode::Keep => Some("keep"),
+            RequiresOpenaiAuthMode::Strip => Some("strip"),
+            RequiresOpenaiAuthMode::Auto => None,
+        }
+    }
+}
+
+/// Storage keys for the explicit override. Only `keep`/`strip` are ever written;
+/// `auto` is represented by the key being absent, mirroring `modelCatalog` and
+/// `autoReviewModelOverride`, which are likewise omitted when default.
+const CODEX_REQUIRES_OPENAI_AUTH_MODE_KEY: &str = "requiresOpenaiAuthMode";
+const CODEX_REQUIRES_OPENAI_AUTH_MODE_KEY_SNAKE: &str = "requires_openai_auth_mode";
+
+/// Unknown values and `auto` fall back to [`RequiresOpenaiAuthMode::Auto`], so a
+/// typo can never drive the projection into a state Codex rejects.
+fn normalize_codex_requires_openai_auth_mode(value: Option<&Value>) -> RequiresOpenaiAuthMode {
+    match value.and_then(|item| item.as_str()).map(str::trim) {
+        Some("keep") => RequiresOpenaiAuthMode::Keep,
+        Some("strip") => RequiresOpenaiAuthMode::Strip,
+        _ => RequiresOpenaiAuthMode::Auto,
+    }
+}
+
+fn resolve_codex_requires_openai_auth_mode(
+    settings_object: &serde_json::Map<String, serde_json::Value>,
+) -> RequiresOpenaiAuthMode {
+    normalize_codex_requires_openai_auth_mode(
+        settings_object
+            .get(CODEX_REQUIRES_OPENAI_AUTH_MODE_KEY)
+            .or_else(|| settings_object.get(CODEX_REQUIRES_OPENAI_AUTH_MODE_KEY_SNAKE)),
+    )
+}
+
+/// Read the live `requires_openai_auth` value of the active provider as an
+/// explicit mode, for the live-config adoption path (`__local__`).
+///
+/// Adopting must not lose a hand-tuned value: the projection owns the field now,
+/// so a live `true` the user set by hand would otherwise be dropped along with
+/// the stored line. `false` and an absent key are equivalent to Codex, but only
+/// `false` is a deliberate statement — so only it becomes `Strip`; absent stays
+/// `Auto` and keeps deriving from the auth mechanism.
+fn codex_requires_openai_auth_mode_from_config_toml(config_toml: &str) -> RequiresOpenaiAuthMode {
+    if config_toml.trim().is_empty() {
+        return RequiresOpenaiAuthMode::Auto;
+    }
+    let Ok(document) = parse_toml_document(config_toml, "config.toml") else {
+        return RequiresOpenaiAuthMode::Auto;
+    };
+    let Some(provider_id) = active_codex_model_provider_id(&document) else {
+        return RequiresOpenaiAuthMode::Auto;
+    };
+
+    match document
+        .as_table()
+        .get("model_providers")
+        .and_then(|item| item.as_table_like())
+        .and_then(|providers| providers.get(&provider_id))
+        .and_then(|provider| provider.as_table_like())
+        .and_then(|provider| provider.get("requires_openai_auth"))
+        .and_then(|item| item.as_bool())
+    {
+        Some(true) => RequiresOpenaiAuthMode::Keep,
+        Some(false) => RequiresOpenaiAuthMode::Strip,
+        None => RequiresOpenaiAuthMode::Auto,
+    }
+}
+
 /// Drop `requires_openai_auth` from the active provider's `[model_providers.<id>]`
 /// table.
 ///
@@ -1977,11 +2085,77 @@ fn strip_active_provider_requires_openai_auth(config_toml: &str) -> Result<Strin
     Ok(document.to_string())
 }
 
+/// Force `requires_openai_auth = true` on the active provider's
+/// `[model_providers.<id>]` table (issue #394).
+///
+/// This has to actively write rather than merely "not strip": the flag used to
+/// exist only because the frontend injected it into every custom provider, and
+/// issue #353's users had hand-deleted the line — exactly the configs that now
+/// need it back.
+///
+/// A config with no resolvable active provider table is left untouched with a
+/// warning instead of being rejected. That shape (notably official providers
+/// whose stored config carries no `model_provider`) applies successfully today,
+/// and Codex then falls back to its built-in `openai` provider, which already
+/// requires OpenAI auth — so the user's intent holds without our help. Rejecting
+/// would turn a working apply into a hard failure.
+fn set_active_provider_requires_openai_auth(config_toml: &str) -> Result<String, String> {
+    if config_toml.trim().is_empty() {
+        return Ok(config_toml.to_string());
+    }
+
+    let mut document = parse_toml_document(config_toml, "config.toml")?;
+    let Some(provider_id) = active_codex_model_provider_id(&document) else {
+        log::warn!(
+            "config.toml has no active model_provider; leaving requires_openai_auth unchanged"
+        );
+        return Ok(document.to_string());
+    };
+
+    if let Some(provider_table) = document
+        .as_table_mut()
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_like_mut())
+        .and_then(|providers| providers.get_mut(&provider_id))
+        .and_then(|item| item.as_table_like_mut())
+    {
+        provider_table.insert("requires_openai_auth", toml_edit::value(true));
+    } else {
+        log::warn!(
+            "model_providers.{provider_id} is missing; leaving requires_openai_auth unchanged"
+        );
+    }
+
+    Ok(document.to_string())
+}
+
+/// [`project_codex_auth_to_runtime_config_with_mode`] with the automatic rule.
+///
+/// The real apply/cleanup call sites all go through the mode-aware variant; this
+/// 4-arg entry point is kept so the pre-existing tests keep asserting the
+/// automatic behaviour unchanged (issue #394).
+#[cfg(test)]
 fn project_codex_auth_to_runtime_config(
     managed_config_toml: &str,
     managed_auth: &serde_json::Value,
     preserve_official_auth: bool,
     provider_category: &str,
+) -> Result<String, String> {
+    project_codex_auth_to_runtime_config_with_mode(
+        managed_config_toml,
+        managed_auth,
+        preserve_official_auth,
+        provider_category,
+        RequiresOpenaiAuthMode::Auto,
+    )
+}
+
+fn project_codex_auth_to_runtime_config_with_mode(
+    managed_config_toml: &str,
+    managed_auth: &serde_json::Value,
+    preserve_official_auth: bool,
+    provider_category: &str,
+    mode: RequiresOpenaiAuthMode,
 ) -> Result<String, String> {
     let api_key = extract_codex_managed_api_key(managed_auth);
 
@@ -1993,23 +2167,49 @@ fn project_codex_auth_to_runtime_config(
     // wrong one (auth.json creds instead of the provider bearer token → 401).
     // See issue #353 and the parallel cc-switch#7211 investigation.
     //
-    // Keep `requires_openai_auth` only when Codex should read auth.json:
-    //   - official providers: ChatGPT OAuth tokens in auth.json need it;
-    //   - custom provider with a managed key written to auth.json
-    //     (preserve=false): mirrors `codex login --with-api-key`.
-    // Drop it otherwise:
-    //   - custom provider authenticating via `experimental_bearer_token`
-    //     (preserve=true): `true` makes Codex send auth.json credentials instead
-    //     of the provider bearer token, causing 401 (cc-switch#7211);
-    //   - custom provider with no key at all: nothing to read, so don't demand.
-    // Gateway/relay providers (ccNexus, AxonHub) likewise leave this unset.
-    let uses_openai_auth =
-        provider_category == "official" || (api_key.is_some() && !preserve_official_auth);
+    // Under the automatic rule, keep it only when Codex should read auth.json:
+    // official providers (ChatGPT OAuth tokens) and a custom provider whose
+    // managed key is written there (mirrors `codex login --with-api-key`). Drop
+    // it for a keyless custom provider — nothing to read, so don't demand — which
+    // is also what gateway/relay providers (ccNexus, AxonHub) do.
+    //
+    // Precedence: official > explicit mode > preserve > automatic rule.
+    //
+    // The projection always writes or removes the field — there is no "leave
+    // as-is" branch — so its presence on disk never depends on an earlier
+    // projection having happened to contain it.
+    //
+    // An explicit `keep` deliberately beats `preserve_official_auth`. The two
+    // fields are complementary in Codex, not mutually exclusive:
+    // `experimental_bearer_token`/`env_key` select the credential, while
+    // `requires_openai_auth` only declares the provider first-party-account
+    // backed. `provider_uses_first_party_auth_path`
+    // (codex-rs/model-provider/src/provider.rs) requires
+    // `experimental_bearer_token.is_none()`, so a bearer token short-circuits
+    // that path and Codex keeps using the relay key — the cc-switch#7211 401
+    // does not arise from this shape. Meanwhile `account_state()` resolves the
+    // account whenever the flag is set, which is what enables the account-gated
+    // features (fast mode, voice, image generation) issue #394 asked for. So an
+    // explicit intent wins and the form warns instead of blocking.
+    let should_keep_requires_openai_auth = if provider_category == "official" {
+        true
+    } else {
+        match mode {
+            RequiresOpenaiAuthMode::Keep => true,
+            RequiresOpenaiAuthMode::Strip => false,
+            // Only the automatic rule consults `preserve_official_auth`: the
+            // bearer-token projection owns the auth mechanism when the user has
+            // not said otherwise.
+            RequiresOpenaiAuthMode::Auto if preserve_official_auth => false,
+            RequiresOpenaiAuthMode::Auto => api_key.is_some(),
+        }
+    };
 
-    let mut config_toml = managed_config_toml.to_string();
-    if !uses_openai_auth {
-        config_toml = strip_active_provider_requires_openai_auth(&config_toml)?;
-    }
+    let config_toml = if should_keep_requires_openai_auth {
+        set_active_provider_requires_openai_auth(managed_config_toml)?
+    } else {
+        strip_active_provider_requires_openai_auth(managed_config_toml)?
+    };
 
     if !preserve_official_auth {
         return Ok(config_toml);
@@ -2303,6 +2503,12 @@ fn extract_provider_settings_for_storage(
     };
     let normalized_config_toml =
         strip_protected_top_level_sections_from_toml(&stripped_common_config_toml)?;
+    // The projection owns `requires_openai_auth` outright, so storage must not
+    // carry it: otherwise the editor would advertise a value the next apply
+    // silently overrides — the exact confusion behind issue #394. The explicit
+    // mode below is the sanctioned way to express intent.
+    let normalized_config_toml =
+        strip_active_provider_requires_openai_auth(&normalized_config_toml)?;
 
     let mut provider_settings = serde_json::json!({
         "auth": auth_value,
@@ -2316,6 +2522,12 @@ fn extract_provider_settings_for_storage(
     {
         provider_settings["autoReviewModelOverride"] =
             serde_json::Value::String(auto_review_model_override);
+    }
+    if let Some(requires_openai_auth_mode) =
+        resolve_codex_requires_openai_auth_mode(settings_object).as_storage_str()
+    {
+        provider_settings[CODEX_REQUIRES_OPENAI_AUTH_MODE_KEY] =
+            serde_json::Value::String(requires_openai_auth_mode.to_string());
     }
 
     Ok(provider_settings)
@@ -2739,6 +2951,49 @@ fn render_codex_config_document(document: &toml_edit::DocumentMut) -> String {
     }
 }
 
+/// Provider-table auth fields the projection owns outright.
+const CODEX_MANAGED_PROVIDER_AUTH_KEYS: [&str; 2] =
+    ["requires_openai_auth", "experimental_bearer_token"];
+
+/// Clear the projection-owned auth fields from the provider table the next
+/// config activates.
+///
+/// [`remove_managed_toml_fields`] only deletes keys that `previous_managed`
+/// actually contains, so a field survives on disk forever whenever the snapshot
+/// was projected under a different rule than the apply that wrote the file. That
+/// is not hypothetical: flipping `codex_preserve_official_auth_on_switch`
+/// re-projects `previous_managed` with the *new* flag, which left both
+/// `requires_openai_auth` and `experimental_bearer_token` on disk at once — the
+/// exact 401 that cc-switch#7211 describes. Clearing them here makes the
+/// outcome independent of `previous_managed` entirely, which is also what lets
+/// an explicit `keep` work on a config whose line the user had hand-deleted
+/// (issue #394).
+///
+/// Only the active table is touched: other provider tables in the user's file
+/// are not ours to edit.
+fn clear_managed_provider_auth_keys(
+    document: &mut toml_edit::DocumentMut,
+    next_managed_document: &toml_edit::DocumentMut,
+) {
+    let Some(provider_id) = active_codex_model_provider_id(next_managed_document)
+        .or_else(|| active_codex_model_provider_id(document))
+    else {
+        return;
+    };
+
+    if let Some(provider_table) = document
+        .as_table_mut()
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_like_mut())
+        .and_then(|providers| providers.get_mut(&provider_id))
+        .and_then(|item| item.as_table_like_mut())
+    {
+        for key in CODEX_MANAGED_PROVIDER_AUTH_KEYS {
+            provider_table.remove(key);
+        }
+    }
+}
+
 fn build_written_codex_config_toml(
     existing_config_toml: &str,
     previous_managed_config_toml: Option<&str>,
@@ -2759,6 +3014,11 @@ fn build_written_codex_config_toml(
             true,
         );
     }
+
+    // The projection owns the provider auth fields, so clear them from the table
+    // the next config activates before merging: the diff above can only remove
+    // keys that `previous_managed` happened to contain.
+    clear_managed_provider_auth_keys(&mut current_document, &next_managed_document);
 
     merge_toml_tables(
         current_document.as_table_mut(),
@@ -4213,11 +4473,16 @@ async fn get_managed_codex_config_for_provider_cleanup(
     // `requires_openai_auth` (and bearer-token) fields on disk after switching.
     let preserve_official_auth =
         should_preserve_codex_official_auth(provider, load_codex_auth_preservation_enabled(db)?);
-    let projected_config = project_codex_auth_to_runtime_config(
+    let requires_openai_auth_mode = provider_config
+        .as_object()
+        .map(resolve_codex_requires_openai_auth_mode)
+        .unwrap_or(RequiresOpenaiAuthMode::Auto);
+    let projected_config = project_codex_auth_to_runtime_config_with_mode(
         &managed_config,
         &auth,
         preserve_official_auth,
         &provider.category,
+        requires_openai_auth_mode,
     )?;
     if provider.category == "official" && load_codex_unified_session_history_enabled(db)? {
         unified_history::inject_unified_session_history_config(&projected_config)
@@ -4240,11 +4505,16 @@ async fn get_managed_codex_config_for_provider_cleanup_with_unified_history(
         get_managed_codex_config_for_provider(db, &provider.settings_config).await?;
     let preserve_official_auth =
         should_preserve_codex_official_auth(provider, load_codex_auth_preservation_enabled(db)?);
-    let projected_config = project_codex_auth_to_runtime_config(
+    let requires_openai_auth_mode = provider_config
+        .as_object()
+        .map(resolve_codex_requires_openai_auth_mode)
+        .unwrap_or(RequiresOpenaiAuthMode::Auto);
+    let projected_config = project_codex_auth_to_runtime_config_with_mode(
         &managed_config,
         &auth,
         preserve_official_auth,
         &provider.category,
+        requires_openai_auth_mode,
     )?;
     if provider.category == "official" && unified_history_enabled {
         unified_history::inject_unified_session_history_config(&projected_config)
@@ -4587,11 +4857,16 @@ async fn apply_config_to_file_with_previous_managed_config(
         should_preserve_codex_official_auth(&provider, auth_preservation_enabled);
     let managed_config =
         build_managed_codex_config(&provider.settings_config, common_toml.as_deref())?;
-    let mut final_config = project_codex_auth_to_runtime_config(
+    let requires_openai_auth_mode = provider_config
+        .as_object()
+        .map(resolve_codex_requires_openai_auth_mode)
+        .unwrap_or(RequiresOpenaiAuthMode::Auto);
+    let mut final_config = project_codex_auth_to_runtime_config_with_mode(
         &managed_config,
         &auth,
         preserve_official_auth,
         &provider.category,
+        requires_openai_auth_mode,
     )?;
     if provider.category == "official" && load_codex_unified_session_history_enabled(db)? {
         final_config = unified_history::inject_unified_session_history_config(&final_config)?;
@@ -5261,15 +5536,17 @@ mod tests {
         extract_provider_settings_for_storage, fill_template_fields_from_static,
         heal_dangling_codex_model_provider, infer_codex_provider_category_from_settings,
         merge_codex_auth_json, merge_remote_codex_official_models, normalize_codex_model_tier,
-        prepare_codex_config_with_model_catalog, project_codex_auth_to_runtime_config,
+        normalize_codex_requires_openai_auth_mode, prepare_codex_config_with_model_catalog,
+        project_codex_auth_to_runtime_config, project_codex_auth_to_runtime_config_with_mode,
         read_codex_aggregate_selection, read_codex_catalog_preview, remove_codex_aggregate_catalog,
-        resolve_local_provider_meta, restore_codex_pre_aggregate_catalog,
-        sanitize_codex_catalog_input_modalities, static_codex_official_models,
-        strip_codex_common_config_from_toml, write_codex_aggregate_catalog, AggregateCatalogEntry,
-        CodexCatalogModelSpec, CodexHistoryRuntimeSource, CodexHistorySourceCandidate,
-        CodexHistorySourceMode, RemoteCodexModel, AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME,
+        resolve_codex_requires_openai_auth_mode, resolve_local_provider_meta,
+        restore_codex_pre_aggregate_catalog, sanitize_codex_catalog_input_modalities,
+        static_codex_official_models, strip_codex_common_config_from_toml,
+        write_codex_aggregate_catalog, AggregateCatalogEntry, CodexCatalogModelSpec,
+        CodexHistoryRuntimeSource, CodexHistorySourceCandidate, CodexHistorySourceMode,
+        RemoteCodexModel, RequiresOpenaiAuthMode, AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME,
         CODEX_AGGREGATE_DEFAULT_CONTEXT_WINDOW, CODEX_BUILTIN_IMAGE_MODEL_ID,
-        HIDDEN_ALIAS_PRIORITY_BASE,
+        CODEX_REQUIRES_OPENAI_AUTH_MODE_KEY, HIDDEN_ALIAS_PRIORITY_BASE,
     };
     use crate::coding::codex::types::CodexProviderInput;
     use crate::coding::codex::unified_history;
@@ -8153,6 +8430,53 @@ name = "new-provider"
         assert_eq!(doc["mcp_servers"]["test"]["command"].as_str(), Some("uvx"));
     }
 
+    /// `[projects]` is Codex's trust map: a rewrite may neither drop the user's
+    /// entries nor project a new one (issue #400 cleans them on request instead).
+    #[test]
+    fn build_written_codex_config_toml_keeps_project_trust_entries() {
+        let existing = r#"
+[projects.'c:\users\me\documents\codex\2026-08-31\new-chat']
+trust_level = "trusted"
+
+[model_providers.old]
+name = "old-provider"
+"#;
+
+        // A managed snapshot that happens to carry the table (e.g. the user
+        // pasted a whole config.toml into the common config) must not let the
+        // diff delete a live trust entry.
+        let previous_managed = r#"
+[projects.'c:\users\me\documents\codex\2026-08-31\new-chat']
+trust_level = "trusted"
+
+[model_providers.old]
+name = "old-provider"
+"#;
+
+        let next_managed = r#"
+model_provider = "custom"
+
+[projects."/tmp/not-ours"]
+trust_level = "trusted"
+
+[model_providers.custom]
+name = "new-provider"
+"#;
+
+        let rendered =
+            build_written_codex_config_toml(existing, Some(previous_managed), next_managed)
+                .unwrap();
+        let doc: DocumentMut = rendered.parse().unwrap();
+
+        assert!(doc["model_providers"].get("old").is_none());
+        assert_eq!(
+            doc["projects"][r"c:\users\me\documents\codex\2026-08-31\new-chat"]["trust_level"]
+                .as_str(),
+            Some("trusted")
+        );
+        assert!(doc["projects"].get("/tmp/not-ours").is_none());
+    }
+
     #[test]
     fn build_written_codex_config_toml_manages_common_features_but_keeps_plugin_feature() {
         let existing = r#"
@@ -8254,6 +8578,269 @@ model = "gpt-5.4"
         assert!(
             error.contains("config.toml has no active model_provider"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn project_codex_auth_keep_activates_requires_openai_auth_when_managed_toml_lacks_it() {
+        // issue #394: a relay that authenticates with the ChatGPT OAuth token in
+        // auth.json carries no managed API key, so the automatic rule classified
+        // it as keyless and stripped the flag with no way to opt back in.
+        // `keep` must actively WRITE it — "don't strip" would be a silent no-op
+        // here, because issue #353's users had hand-deleted exactly this line.
+        let managed_config = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "AICodeMirror"
+base_url = "https://api.example.com/api/codex/backend-api/codex"
+wire_api = "responses"
+"#;
+        let managed_auth = json!({});
+
+        let projected = project_codex_auth_to_runtime_config_with_mode(
+            managed_config,
+            &managed_auth,
+            false,
+            "custom",
+            RequiresOpenaiAuthMode::Keep,
+        )
+        .unwrap();
+        let doc: DocumentMut = projected.parse().unwrap();
+
+        assert_eq!(
+            doc["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn project_codex_auth_keep_is_a_noop_without_provider_table() {
+        // `keep` must not reject a config it cannot write to. An official
+        // provider's stored config routinely has no `model_provider`, and that
+        // shape applies successfully today — Codex then falls back to its
+        // built-in `openai` provider, which already requires OpenAI auth, so the
+        // user's intent holds without our help.
+        let managed_config = r#"
+model = "gpt-5.4"
+"#;
+        let managed_auth = json!({});
+
+        let projected = project_codex_auth_to_runtime_config_with_mode(
+            managed_config,
+            &managed_auth,
+            false,
+            "custom",
+            RequiresOpenaiAuthMode::Keep,
+        )
+        .unwrap();
+
+        assert_eq!(projected, managed_config);
+    }
+
+    #[test]
+    fn project_codex_auth_strip_mode_removes_requires_openai_auth_for_keyed_custom_provider() {
+        // The case proving the override is not a re-spelling of `auto`: with a
+        // managed key and preserve=false the automatic rule KEEPS the flag
+        // (mirrors `codex login --with-api-key`), and `strip` must still remove it.
+        let managed_config = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#;
+        let managed_auth = json!({ "OPENAI_API_KEY": "sk-third-party" });
+
+        let projected = project_codex_auth_to_runtime_config_with_mode(
+            managed_config,
+            &managed_auth,
+            false,
+            "custom",
+            RequiresOpenaiAuthMode::Strip,
+        )
+        .unwrap();
+        let doc: DocumentMut = projected.parse().unwrap();
+
+        assert!(doc["model_providers"]["custom"]
+            .as_table_like()
+            .expect("custom provider table")
+            .get("requires_openai_auth")
+            .is_none());
+    }
+
+    #[test]
+    fn requires_openai_auth_mode_keep_beats_preserve_official_auth() {
+        // Issue #394: the two managed auth fields are complementary in Codex —
+        // `experimental_bearer_token` selects the credential while
+        // `requires_openai_auth` only declares the provider first-party-account
+        // backed. `provider_uses_first_party_auth_path` requires
+        // `experimental_bearer_token.is_none()`, so the relay key still wins as
+        // the credential and there is no cc-switch#7211 401. An explicit `keep`
+        // therefore has to be able to produce both fields at once; the preserve
+        // switch (which only owns the credential projection) no longer overrides
+        // it. The automatic rule keeps the conservative behaviour — see
+        // `project_codex_auth_strips_requires_openai_auth_when_projecting_bearer_token`.
+        let managed_config = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#;
+        let managed_auth = json!({ "OPENAI_API_KEY": "sk-third-party" });
+
+        let projected = project_codex_auth_to_runtime_config_with_mode(
+            managed_config,
+            &managed_auth,
+            true,
+            "custom",
+            RequiresOpenaiAuthMode::Keep,
+        )
+        .unwrap();
+        let doc: DocumentMut = projected.parse().unwrap();
+
+        let table = doc["model_providers"]["custom"]
+            .as_table_like()
+            .expect("custom provider table");
+        assert_eq!(
+            table
+                .get("requires_openai_auth")
+                .and_then(|item| item.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            table
+                .get("experimental_bearer_token")
+                .and_then(|item| item.as_str()),
+            Some("sk-third-party")
+        );
+    }
+
+    #[test]
+    fn requires_openai_auth_mode_keep_with_preserve_writes_both_auth_fields() {
+        // Issue #394 reporter scenario, through the real pipeline: a relay that
+        // accepts the OpenAI auth token, with "keep official login when
+        // switching" ON and mode=keep. Both managed auth fields must land on
+        // disk — the bearer token supplies the credential while the flag
+        // enables the account-gated features (/fast, voice). Selecting `auto`
+        // afterwards must drop the flag again while keeping the bearer token.
+        let keyed_provider_config = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+"#;
+        let managed_auth = json!({ "OPENAI_API_KEY": "sk-third-party" });
+        let project = |preserve, mode| {
+            project_codex_auth_to_runtime_config_with_mode(
+                keyed_provider_config,
+                &managed_auth,
+                preserve,
+                "custom",
+                mode,
+            )
+            .unwrap()
+        };
+
+        // What the last apply wrote: auto + preserve=false on a keyed provider
+        // keeps the flag (mirrors `codex login --with-api-key`), no bearer token.
+        let previous = project(false, RequiresOpenaiAuthMode::Auto);
+        let doc: DocumentMut = previous.parse().unwrap();
+        let table = doc["model_providers"]["custom"].as_table_like().unwrap();
+        assert_eq!(
+            table
+                .get("requires_openai_auth")
+                .and_then(|item| item.as_bool()),
+            Some(true)
+        );
+        assert!(table.get("experimental_bearer_token").is_none());
+
+        // Flip preserve on and pick `keep`: both fields, explicitly.
+        let next_keep = project(true, RequiresOpenaiAuthMode::Keep);
+        let written =
+            build_written_codex_config_toml(&previous, Some(&previous), &next_keep).unwrap();
+        let doc: DocumentMut = written.parse().unwrap();
+        let table = doc["model_providers"]["custom"].as_table_like().unwrap();
+        assert_eq!(
+            table
+                .get("requires_openai_auth")
+                .and_then(|item| item.as_bool()),
+            Some(true),
+            "an explicit keep must survive the preserve switch"
+        );
+        assert_eq!(
+            table
+                .get("experimental_bearer_token")
+                .and_then(|item| item.as_str()),
+            Some("sk-third-party"),
+            "the bearer token must still be the credential"
+        );
+
+        // Back to `auto`: preserve owns the auth mechanism again, so the flag
+        // goes away without touching the bearer token.
+        let next_auto = project(true, RequiresOpenaiAuthMode::Auto);
+        let written =
+            build_written_codex_config_toml(&written, Some(&next_keep), &next_auto).unwrap();
+        let doc: DocumentMut = written.parse().unwrap();
+        let table = doc["model_providers"]["custom"].as_table_like().unwrap();
+        assert!(
+            table.get("requires_openai_auth").is_none(),
+            "auto + preserve must strip the flag again"
+        );
+        assert_eq!(
+            table
+                .get("experimental_bearer_token")
+                .and_then(|item| item.as_str()),
+            Some("sk-third-party")
+        );
+    }
+
+    #[test]
+    fn codex_requires_openai_auth_mode_normalization_drops_auto_and_unknown() {
+        for value in [Some("KEEP"), Some("auto"), Some(""), Some("nonsense"), None] {
+            assert_eq!(
+                normalize_codex_requires_openai_auth_mode(value.map(Value::from).as_ref()),
+                RequiresOpenaiAuthMode::Auto,
+                "unexpected mode for {value:?}"
+            );
+        }
+        assert_eq!(
+            normalize_codex_requires_openai_auth_mode(Some(&Value::from("keep"))),
+            RequiresOpenaiAuthMode::Keep
+        );
+        assert_eq!(
+            normalize_codex_requires_openai_auth_mode(Some(&Value::from("strip"))),
+            RequiresOpenaiAuthMode::Strip
+        );
+    }
+
+    #[test]
+    fn resolve_codex_requires_openai_auth_mode_prefers_camel_case_over_snake_case() {
+        assert_eq!(
+            resolve_codex_requires_openai_auth_mode(
+                json!({
+                    "requiresOpenaiAuthMode": "strip",
+                    "requires_openai_auth_mode": "keep",
+                })
+                .as_object()
+                .expect("settings object")
+            ),
+            RequiresOpenaiAuthMode::Strip
+        );
+        assert_eq!(
+            resolve_codex_requires_openai_auth_mode(
+                json!({ "requires_openai_auth_mode": "keep" })
+                    .as_object()
+                    .expect("settings object")
+            ),
+            RequiresOpenaiAuthMode::Keep
         );
     }
 
@@ -8410,6 +8997,105 @@ model = "gpt-5.4"
         assert_eq!(doc["model"].as_str(), Some("gpt-5.4"));
         assert!(doc.get("model_provider").is_none());
         assert!(doc.get("model_providers").is_none());
+    }
+
+    #[test]
+    fn build_written_codex_config_toml_clears_requires_openai_auth_without_previous_snapshot() {
+        // issue #394 regression: `remove_managed_toml_fields` only deletes keys
+        // that `previous_managed` actually contains, so a stale flag survives
+        // whenever the snapshot was projected under a different rule than the
+        // apply that wrote the file. Flipping `codex_preserve_official_auth_on_switch`
+        // does exactly that — it re-projects `previous` with the NEW flag. The
+        // projection owns the auth fields outright now, so the written file must
+        // not keep either of them.
+        let existing = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://api.example.com/v1"
+requires_openai_auth = true
+"#;
+        // What the next apply's rule produces, and therefore what `previous` looks
+        // like once it is re-projected under the new setting.
+        let previous_managed = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://api.example.com/v1"
+"#;
+
+        let rendered =
+            build_written_codex_config_toml(existing, Some(previous_managed), previous_managed)
+                .unwrap();
+        let doc: DocumentMut = rendered.parse().unwrap();
+
+        assert_eq!(doc["model_provider"].as_str(), Some("custom"));
+        assert!(doc["model_providers"]["custom"]
+            .as_table_like()
+            .expect("custom provider table")
+            .get("requires_openai_auth")
+            .is_none());
+    }
+
+    #[test]
+    fn requires_openai_auth_mode_change_round_trips_through_managed_diff() {
+        // issue #394: switching a provider from auto to keep must add the line,
+        // and switching back must remove it — using the real pipeline shape where
+        // `previous` comes from the OLD provider row rather than being
+        // re-projected under the new rule.
+        let keyless_provider_config = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+"#;
+        let managed_auth = json!({});
+        let project = |mode| {
+            project_codex_auth_to_runtime_config_with_mode(
+                keyless_provider_config,
+                &managed_auth,
+                false,
+                "custom",
+                mode,
+            )
+            .unwrap()
+        };
+
+        // `auto` on a keyless provider strips (issue #353), so this is what the
+        // last apply actually wrote to disk.
+        let auto_projection = project(RequiresOpenaiAuthMode::Auto);
+        let keep_projection = project(RequiresOpenaiAuthMode::Keep);
+
+        let after_keep = build_written_codex_config_toml(
+            &auto_projection,
+            Some(&auto_projection),
+            &keep_projection,
+        )
+        .unwrap();
+        let doc: DocumentMut = after_keep.parse().unwrap();
+        assert_eq!(
+            doc["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
+            Some(true),
+            "auto -> keep must add the line"
+        );
+
+        // Switching back: `previous` is the keep projection, i.e. what is on disk.
+        let back_to_auto =
+            build_written_codex_config_toml(&after_keep, Some(&keep_projection), &auto_projection)
+                .unwrap();
+        let doc: DocumentMut = back_to_auto.parse().unwrap();
+        assert!(
+            doc["model_providers"]["custom"]
+                .as_table_like()
+                .expect("custom provider table")
+                .get("requires_openai_auth")
+                .is_none(),
+            "keep -> auto must remove the line"
+        );
     }
 
     #[test]
@@ -8719,6 +9405,67 @@ approval_policy = "never"
         assert!(doc.get("approval_policy").is_none());
         assert!(doc["features"].get("plugins").is_none());
         assert_eq!(doc["features"]["test_generation"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn extract_provider_settings_for_storage_keeps_requires_openai_auth_mode() {
+        let settings = json!({
+            "auth": { "OPENAI_API_KEY": "sk-test" },
+            "config": "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://api.example.com/v1\"\nrequires_openai_auth = true\n",
+            "requiresOpenaiAuthMode": "strip"
+        });
+
+        let provider_settings = extract_provider_settings_for_storage(&settings, None).unwrap();
+
+        assert_eq!(
+            provider_settings[CODEX_REQUIRES_OPENAI_AUTH_MODE_KEY].as_str(),
+            Some("strip")
+        );
+        // The projection owns the flag, so storage must not carry it — otherwise
+        // the editor would advertise a value the next apply overrides (#394).
+        let stored_config = provider_settings["config"]
+            .as_str()
+            .expect("stored config string");
+        assert!(
+            !stored_config.contains("requires_openai_auth"),
+            "stored config should not carry the generated flag: {stored_config}"
+        );
+    }
+
+    #[test]
+    fn extract_provider_settings_for_storage_omits_auto_and_unknown_requires_openai_auth_mode() {
+        for mode in [json!("auto"), json!("KEEP"), json!(true), json!(null)] {
+            let settings = json!({
+                "auth": {},
+                "config": "model_provider = \"custom\"\n",
+                "requiresOpenaiAuthMode": mode,
+            });
+
+            let provider_settings = extract_provider_settings_for_storage(&settings, None).unwrap();
+
+            assert!(
+                provider_settings
+                    .get(CODEX_REQUIRES_OPENAI_AUTH_MODE_KEY)
+                    .is_none(),
+                "mode {mode} should normalize to auto, i.e. the absent key"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_provider_settings_for_storage_accepts_snake_case_requires_openai_auth_mode() {
+        let settings = json!({
+            "auth": {},
+            "config": "model_provider = \"custom\"\n",
+            "requires_openai_auth_mode": "keep",
+        });
+
+        let provider_settings = extract_provider_settings_for_storage(&settings, None).unwrap();
+
+        assert_eq!(
+            provider_settings[CODEX_REQUIRES_OPENAI_AUTH_MODE_KEY].as_str(),
+            Some("keep")
+        );
     }
 
     #[test]
