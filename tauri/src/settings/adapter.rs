@@ -326,6 +326,25 @@ fn normalize_visible_tabs_order(tabs: Vec<String>) -> Vec<String> {
         "ssh",
         "wsl",
     ];
+    // Previous default before Antigravity was added.
+    const PRE_ANTIGRAVITY_DEFAULT_VISIBLE_TABS: &[&str] = &[
+        "opencode",
+        "claudecode",
+        "claudedesktop",
+        "codex",
+        "grok",
+        "geminicli",
+        "kimi",
+        "openclaw",
+        "pi",
+        "oh_my_pi",
+        "hermes",
+        "dsh",
+        "gateway",
+        "image",
+        "ssh",
+        "wsl",
+    ];
     const CURRENT_DEFAULT_VISIBLE_TABS: &[&str] = &[
         "opencode",
         "claudecode",
@@ -333,6 +352,7 @@ fn normalize_visible_tabs_order(tabs: Vec<String>) -> Vec<String> {
         "codex",
         "grok",
         "geminicli",
+        "antigravity",
         "kimi",
         "openclaw",
         "pi",
@@ -352,6 +372,7 @@ fn normalize_visible_tabs_order(tabs: Vec<String>) -> Vec<String> {
         || string_vec_matches(&tabs, PRE_OMP_DEFAULT_VISIBLE_TABS)
         || string_vec_matches(&tabs, PRE_DESKTOP_DEFAULT_VISIBLE_TABS)
         || string_vec_matches(&tabs, PRE_KIMI_DEFAULT_VISIBLE_TABS)
+        || string_vec_matches(&tabs, PRE_ANTIGRAVITY_DEFAULT_VISIBLE_TABS)
     {
         return CURRENT_DEFAULT_VISIBLE_TABS
             .iter()
@@ -616,6 +637,55 @@ mod tests {
                 "codex",
                 "grok",
                 "geminicli",
+                "antigravity",
+                "kimi",
+                "openclaw",
+                "pi",
+                "oh_my_pi",
+                "hermes",
+                "dsh",
+                "gateway",
+                "image",
+                "ssh",
+                "wsl",
+            ]
+        );
+    }
+
+    #[test]
+    fn visible_tabs_pre_antigravity_default_is_migrated() {
+        let settings = from_db_value(json!({
+            "visible_tabs": [
+                "opencode",
+                "claudecode",
+                "claudedesktop",
+                "codex",
+                "grok",
+                "geminicli",
+                "antigravity",
+                "kimi",
+                "openclaw",
+                "pi",
+                "oh_my_pi",
+                "hermes",
+                "dsh",
+                "gateway",
+                "image",
+                "ssh",
+                "wsl",
+            ]
+        }));
+
+        assert_eq!(
+            settings.visible_tabs,
+            vec![
+                "opencode",
+                "claudecode",
+                "claudedesktop",
+                "codex",
+                "grok",
+                "geminicli",
+                "antigravity",
                 "kimi",
                 "openclaw",
                 "pi",
@@ -654,6 +724,7 @@ mod tests {
                 "codex",
                 "grok",
                 "geminicli",
+                "antigravity",
                 "kimi",
                 "openclaw",
                 "pi",
@@ -692,6 +763,7 @@ mod tests {
                 "codex",
                 "grok",
                 "geminicli",
+                "antigravity",
                 "kimi",
                 "openclaw",
                 "pi",
@@ -761,6 +833,7 @@ mod tests {
                 "codex",
                 "grok",
                 "geminicli",
+                "antigravity",
                 "kimi",
                 "openclaw",
                 "pi",
@@ -806,6 +879,7 @@ mod tests {
                 "codex",
                 "grok",
                 "geminicli",
+                "antigravity",
                 "kimi",
                 "openclaw",
                 "pi",
@@ -847,6 +921,7 @@ mod tests {
                 "codex",
                 "grok",
                 "geminicli",
+                "antigravity",
                 "kimi",
                 "openclaw",
                 "pi",
