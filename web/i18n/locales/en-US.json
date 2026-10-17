@@ -90,6 +90,11 @@
         },
         "range": {
           "today": "Today",
+          "yesterday": "Yesterday",
+          "week": "This week",
+          "last_week": "Last week",
+          "month": "This month",
+          "year": "This year",
           "1d": "1d",
           "7d": "7d",
           "14d": "14d",
@@ -127,7 +132,13 @@
         "unpricedModelsHint": "{{count}} model(s) in this range have no matching model price, so the amount only counts reported or priced usage. Missing pricing does not mean free.",
         "unpricedModelsAction": "Add model prices",
         "unpricedModelTag": "No price",
-        "unpricedModelsMore": "and {{count}} more"
+        "unpricedModelsMore": "and {{count}} more",
+        "pricingUnit": "Per million tokens, USD:",
+        "pricingInput": "Input {{value}}",
+        "pricingOutput": "Output {{value}}",
+        "pricingCacheRead": "Cache read {{value}}",
+        "pricingCacheCreation": "Cache creation {{value}}",
+        "pricingUnavailable": "No price matched this model, so the amount only counts reported or priced usage."
       },
       "pricing": {
         "open": "Pricing config",

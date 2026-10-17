@@ -63,6 +63,32 @@ test('request presets use the statistics ranges and refresh their relative end t
   assert.equal(resolveGatewayRequestRange({ preset: 'today' }, now).start_date, new Date(2026, 8, 12).getTime() / 1000);
 });
 
+test('natural-boundary presets end where the next period starts', () => {
+  // Wednesday 2026-09-16 22:24 local.
+  const now = new Date(2026, 8, 16, 22, 24).getTime();
+  const dayMs = 86_400_000;
+  const todayStart = new Date(2026, 8, 16).getTime();
+  const yesterday = resolveGatewayUsageRange({ preset: 'yesterday' }, now);
+  assert.equal(yesterday.startDate * 1000, todayStart - dayMs);
+  assert.equal(yesterday.endDate * 1000, todayStart);
+  const week = resolveGatewayUsageRange({ preset: 'week' }, now);
+  // Monday of the same week.
+  assert.equal(week.startDate * 1000, new Date(2026, 8, 14).getTime());
+  assert.equal(week.endDate, Math.floor(now / 1000));
+  const lastWeek = resolveGatewayUsageRange({ preset: 'last_week' }, now);
+  assert.equal(lastWeek.startDate * 1000, new Date(2026, 8, 7).getTime());
+  assert.equal(lastWeek.endDate * 1000, new Date(2026, 8, 14).getTime());
+  const month = resolveGatewayUsageRange({ preset: 'month' }, now);
+  assert.equal(month.startDate * 1000, new Date(2026, 8, 1).getTime());
+  const year = resolveGatewayUsageRange({ preset: 'year' }, now);
+  assert.equal(year.startDate * 1000, new Date(2026, 0, 1).getTime());
+  // The request view inherits the same values.
+  assert.deepEqual(resolveGatewayRequestRange({ preset: 'yesterday' }, now), {
+    start_date: yesterday.startDate,
+    end_date: yesterday.endDate,
+  });
+});
+
 test('request all-time and cleared custom ranges preserve the unbounded search', () => {
   assert.deepEqual(resolveGatewayRequestRange({ preset: 'all' }), { start_date: null, end_date: null });
   assert.deepEqual(resolveGatewayRequestRange({ preset: 'custom', customRange: null }), { start_date: null, end_date: null });

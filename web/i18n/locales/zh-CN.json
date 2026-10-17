@@ -90,6 +90,11 @@
         },
         "range": {
           "today": "今天",
+          "yesterday": "昨天",
+          "week": "本周",
+          "last_week": "上周",
+          "month": "本月",
+          "year": "本年",
           "1d": "1d",
           "7d": "7d",
           "14d": "14d",
@@ -127,7 +132,13 @@
         "unpricedModelsHint": "本区间有 {{count}} 个模型未匹配到模型价格，金额只累计已报告或已定价的用量；缺少定价不代表免费。",
         "unpricedModelsAction": "补充模型价格",
         "unpricedModelTag": "未定价",
-        "unpricedModelsMore": "等另 {{count}} 个"
+        "unpricedModelsMore": "等另 {{count}} 个",
+        "pricingUnit": "单价（每百万 tokens，USD）：",
+        "pricingInput": "输入 {{value}}",
+        "pricingOutput": "输出 {{value}}",
+        "pricingCacheRead": "缓存读取 {{value}}",
+        "pricingCacheCreation": "缓存创建 {{value}}",
+        "pricingUnavailable": "该模型未匹配到价格，金额只计算已报告或已定价的用量。"
       },
       "pricing": {
         "open": "定价配置",

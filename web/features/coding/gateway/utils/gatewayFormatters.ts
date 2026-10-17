@@ -503,7 +503,19 @@ export const stringifyDetailValue = (value: unknown) => {
   return JSON.stringify(value, null, 2);
 };
 
-export const GATEWAY_USAGE_RANGE_PRESETS = ['today', '1d', '7d', '14d', '30d', 'custom'] as const;
+export const GATEWAY_USAGE_RANGE_PRESETS = [
+  'today',
+  'yesterday',
+  'week',
+  'last_week',
+  'month',
+  'year',
+  '1d',
+  '7d',
+  '14d',
+  '30d',
+  'custom',
+] as const;
 
 export type GatewayUsageRangePreset = typeof GATEWAY_USAGE_RANGE_PRESETS[number];
 
@@ -548,6 +560,44 @@ export const resolveGatewayUsageRange = (
   if (selection.preset === 'today') {
     return {
       startDate: Math.floor(startOfLocalDay(nowMs) / 1000),
+      endDate,
+    };
+  }
+  const todayStart = startOfLocalDay(nowMs);
+  if (selection.preset === 'yesterday') {
+    // "Yesterday" ends where today begins; a range ending at `now` would
+    // silently include today's usage.
+    return {
+      startDate: Math.floor((todayStart - DAY_MS) / 1000),
+      endDate: Math.floor(todayStart / 1000),
+    };
+  }
+  // Calendar weeks start on Monday; `getDay()` counts from Sunday.
+  const weekdayOffset = (new Date(todayStart).getDay() + 6) % 7;
+  if (selection.preset === 'week') {
+    return {
+      startDate: Math.floor((todayStart - weekdayOffset * DAY_MS) / 1000),
+      endDate,
+    };
+  }
+  if (selection.preset === 'last_week') {
+    const thisWeekStart = todayStart - weekdayOffset * DAY_MS;
+    return {
+      startDate: Math.floor((thisWeekStart - 7 * DAY_MS) / 1000),
+      endDate: Math.floor(thisWeekStart / 1000),
+    };
+  }
+  if (selection.preset === 'month') {
+    const date = new Date(nowMs);
+    return {
+      startDate: Math.floor(new Date(date.getFullYear(), date.getMonth(), 1).getTime() / 1000),
+      endDate,
+    };
+  }
+  if (selection.preset === 'year') {
+    const date = new Date(nowMs);
+    return {
+      startDate: Math.floor(new Date(date.getFullYear(), 0, 1).getTime() / 1000),
       endDate,
     };
   }
